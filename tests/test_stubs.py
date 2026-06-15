@@ -17,24 +17,26 @@ from timeindex.stores import ChainStore, EdgeStore, EventStore, KeyDirectory, Sk
 from timeindex.synthetic import SyntheticStreamGenerator
 
 
-def test_extractor_stub_raises() -> None:
+def test_extractor_smoke() -> None:
     extractor = EventRepresentationExtractor(ExtractorConfig())
-    with pytest.raises(NotImplementedError):
-        extractor.extract(Event(event_id="e1", time=1, event_type="transfer"))
+    record = extractor.extract(Event(event_id="e1", time=1, event_type="transfer"))
+
+    assert record.event.event_id == "e1"
+    assert "type:transfer" in record.lookup_keys
 
 
-def test_scorer_stub_raises() -> None:
+def test_scorer_smoke() -> None:
     scorer = PrototypeScorer(ScoringConfig())
     record = EventRecord(event=Event(event_id="e1", time=1, event_type="transfer"))
-    with pytest.raises(NotImplementedError):
-        scorer.score_local_dependency(record, record)
+    score = scorer.score_local_dependency(record, record)
+
+    assert 0.0 <= score <= 1.0
 
 
-def test_skip_candidate_index_stub_raises() -> None:
+def test_skip_candidate_index_smoke() -> None:
     index = SkipCandidateIndex()
     record = EventRecord(event=Event(event_id="e1", time=1, event_type="transfer"))
-    with pytest.raises(NotImplementedError):
-        index.retrieve(record, DecisionIntent())
+    assert index.retrieve(record, DecisionIntent()) == []
 
 
 def test_constructor_stub_raises() -> None:
@@ -51,7 +53,7 @@ def test_constructor_stub_raises() -> None:
         constructor.add_event(Event(event_id="e1", time=1, event_type="transfer"))
 
 
-def test_retriever_stub_raises() -> None:
+def test_retriever_smoke() -> None:
     retriever = DualFrontierRetriever(
         EventStore(),
         EdgeStore(),
@@ -59,8 +61,9 @@ def test_retriever_stub_raises() -> None:
         SkipLinkStore(),
         RetrievalConfig(),
     )
-    with pytest.raises(NotImplementedError):
-        retriever.retrieve(EventQuery(event=Event(event_id="e1", time=1, event_type="transfer")))
+    result = retriever.retrieve(EventQuery(event=Event(event_id="e1", time=1, event_type="transfer")))
+
+    assert result == []
 
 
 def test_synthetic_stub_raises() -> None:
@@ -69,8 +72,9 @@ def test_synthetic_stub_raises() -> None:
         generator.generate_events()
 
 
-def test_chain_anchor_stub_raises() -> None:
+def test_chain_anchor_smoke() -> None:
     index = SkipCandidateIndex()
     summary = ChainSummary(chain_id="c1", family="generic", head_id="e1", tail_id="e2")
-    with pytest.raises(NotImplementedError):
-        index.add_chain_anchor(summary)
+    index.add_chain_anchor(summary)
+
+    assert index.get_object("c1") is summary
