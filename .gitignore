@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.DS_Store
+key(not for uploaded to github).md
+outputs/
+data/ibm_aml/

@@ -185,6 +185,7 @@ def test_retrieval_returns_skip_evidence() -> None:
     skip_results = [result for result in results if result.object_id.startswith("skip:")]
     assert skip_results
     assert skip_results[0].summary == "Early balance buildup explains the final drain"
+    assert skip_results[0].event_ids[0] == "e1"
 
 
 def test_dual_frontier_beats_chain_only_local_myopia() -> None:
@@ -198,3 +199,68 @@ def test_dual_frontier_beats_chain_only_local_myopia() -> None:
     assert "e1" not in baseline_event_ids
     assert skip_results
     assert skip_results[0].summary.startswith("Early balance buildup")
+
+
+def test_retrieval_excludes_query_event_and_future_events() -> None:
+    records = {
+        "past": _record("past", 1, {"source_accumulation"}),
+        "future": _record("future", 9, {"source_accumulation"}),
+        "q": _record("q", 5, {"full_balance_transfer"}),
+    }
+    edge_store = FakeEdgeStore(
+        {
+            "q": [
+                OrdinaryLink(predecessor_id="past", successor_id="q", score=0.9),
+                OrdinaryLink(predecessor_id="future", successor_id="q", score=0.8),
+            ]
+        }
+    )
+    chain_store = FakeChainStore(
+        {
+            "q": [
+                ChainSummary(
+                    chain_id="chain:past:q",
+                    family="transaction",
+                    head_id="past",
+                    tail_id="q",
+                    representative_event_ids=["past", "q", "future"],
+                    aspects={"source_accumulation", "full_balance_transfer"},
+                    summary="Mixed chain with invalid members",
+                    cost=1.0,
+                )
+            ]
+        }
+    )
+    skip_link_store = FakeSkipLinkStore(
+        {
+            "q": [
+                SkipLink(
+                    from_id="future",
+                    to_id="q",
+                    skip_value=0.95,
+                    aspects={"source_accumulation"},
+                    summary="Future skip should be filtered",
+                    representative_event_ids=["future"],
+                    cost=1.0,
+                )
+            ]
+        }
+    )
+    index = FakeIndex(
+        event_store=FakeEventStore(records),
+        edge_store=edge_store,
+        chain_store=chain_store,
+        skip_link_store=skip_link_store,
+        config=TimeIndexConfig(
+            retrieval=RetrievalConfig(return_summaries=True, allow_skip_expansion=True, default_budget=3),
+            synthetic=None,  # type: ignore[arg-type]
+        ),
+    )
+    index.config.scoring = ScoringConfig(retrieval_stop_threshold=0.01)
+
+    results = retrieve(index, "q", DecisionIntent(aspects={"source_accumulation"}), budget=3)
+
+    retrieved_ids = [event_id for result in results for event_id in result.event_ids]
+    assert "q" not in retrieved_ids
+    assert "future" not in retrieved_ids
+    assert "past" in retrieved_ids

@@ -12,7 +12,7 @@ import numpy as np
 from .config import ExtractorConfig
 from .event import Event, EventRecord
 
-_ENTITY_FIELD_TOKENS = ("id", "account", "user", "host", "service", "device", "src", "dst")
+_ENTITY_FIELD_TOKENS = ("id", "account", "user", "host", "service", "device")
 _CONTEXT_FIELD_TOKENS = (
     "ctx",
     "context",
@@ -28,6 +28,29 @@ _CONTEXT_FIELD_TOKENS = (
     "currency",
 )
 _TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+")
+_SOURCE_ENDPOINT_FIELDS = (
+    "account_id",
+    "src_account",
+    "source_account",
+    "from_account",
+    "origin_account",
+    "sender_account",
+    "src_user",
+    "source_user",
+)
+_DESTINATION_ENDPOINT_FIELDS = (
+    "dst_account",
+    "destination_account",
+    "to_account",
+    "beneficiary_account",
+    "beneficiary_id",
+    "counterparty_account",
+    "recipient_account",
+    "receiver_account",
+    "target_account",
+    "dst_user",
+    "target_user",
+)
 
 
 def extract_keys(event: Event, config: ExtractorConfig | None = None) -> set[str]:
@@ -37,29 +60,50 @@ def extract_keys(event: Event, config: ExtractorConfig | None = None) -> set[str
     keys: set[str] = set()
     keys.add(f"type:{event.event_type}")
     keys.add(f"time_block:{_time_block(event.time, extractor_config.time_bucket_width)}")
+    source_endpoints: set[str] = set()
+    destination_endpoints: set[str] = set()
 
     for field_name, value in event.attrs.items():
         if value is None:
             continue
         normalized_name = field_name.lower()
+        normalized_value = _normalize_scalar(value)
+        role = _flow_role(normalized_name)
+        if role is not None and _is_endpoint_field(normalized_name):
+            keys.add(f"entity:{normalized_name}={normalized_value}")
+            if role == "source":
+                source_endpoints.add(normalized_value)
+                keys.add(f"participant:{normalized_value}")
+                keys.add(f"flow_src:{normalized_value}")
+            elif role == "destination":
+                destination_endpoints.add(normalized_value)
+                keys.add(f"participant:{normalized_value}")
+                keys.add(f"flow_dst:{normalized_value}")
+            continue
         if _is_entity_field(normalized_name):
-            keys.add(f"entity:{normalized_name}={_normalize_scalar(value)}")
+            keys.add(f"entity:{normalized_name}={normalized_value}")
             continue
         if _is_context_field(normalized_name):
-            keys.add(f"ctx:{normalized_name}={_normalize_scalar(value)}")
+            keys.add(f"ctx:{normalized_name}={normalized_value}")
             continue
         if isinstance(value, bool):
             keys.add(f"attr:{normalized_name}={str(value).lower()}")
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
             keys.add(f"attr_bin:{normalized_name}={_numeric_bin(value)}")
         else:
-            keys.add(f"attr:{normalized_name}={_normalize_scalar(value)}")
+            keys.add(f"attr:{normalized_name}={normalized_value}")
 
     for field_name, value in event.ctx.items():
         if value is None:
             continue
         normalized_name = field_name.lower()
         keys.add(f"ctx:{normalized_name}={_normalize_scalar(value)}")
+
+    for source_value in sorted(source_endpoints):
+        for destination_value in sorted(destination_endpoints):
+            if source_value == destination_value:
+                continue
+            keys.add(f"flow_pair:{source_value}->{destination_value}")
 
     return keys
 
@@ -140,7 +184,12 @@ def featurize_event(event: Event, config: ExtractorConfig) -> EventRecord:
     keys = extract_keys(event, config)
     sketch = compute_vector(event, keys, dim=config.sketch_dim)
     aspects = extract_aspects(event)
-    return EventRecord(event=event, lookup_keys=keys, sketch=sketch, aspects=aspects)
+    return EventRecord(
+        event=event,
+        lookup_keys=keys,
+        sketch=sketch,
+        aspects=aspects,
+    )
 
 
 class EventRepresentationExtractor:
@@ -159,6 +208,20 @@ def _is_entity_field(field_name: str) -> bool:
 
 def _is_context_field(field_name: str) -> bool:
     return any(token in field_name for token in _CONTEXT_FIELD_TOKENS)
+
+
+def _is_endpoint_field(field_name: str) -> bool:
+    return field_name in _SOURCE_ENDPOINT_FIELDS or field_name in _DESTINATION_ENDPOINT_FIELDS
+
+
+def _flow_role(field_name: str) -> str | None:
+    if field_name in _SOURCE_ENDPOINT_FIELDS or field_name.startswith(("src_", "source_", "from_", "origin_", "sender_")):
+        return "source"
+    if field_name in _DESTINATION_ENDPOINT_FIELDS or field_name.startswith(
+        ("dst_", "destination_", "to_", "beneficiary_", "counterparty_", "receiver_", "recipient_", "target_")
+    ):
+        return "destination"
+    return None
 
 
 def _time_block(value: str | int | float, width: int) -> int:

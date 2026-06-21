@@ -28,13 +28,19 @@ class FakeEventStore:
         record = self.records.get(event_id)
         return record is not None and not record.metadata.expired
 
-    def expire(self, active_history_size: int) -> None:
-        self.limit = active_history_size
-        while len(self.order) > active_history_size:
+    def expire(self, active_history_size: int | None = None, max_size: int | None = None) -> list[str]:
+        limit = active_history_size if active_history_size is not None else max_size
+        if limit is None:
+            return []
+        self.limit = limit
+        expired: list[str] = []
+        while len(self.order) > limit:
             oldest = self.order.popleft()
             record = self.records.get(oldest)
             if record is not None:
                 record.metadata.expired = True
+                expired.append(oldest)
+        return expired
 
 
 class FakeKeyDirectory:
@@ -55,7 +61,7 @@ class FakeKeyDirectory:
             results.extend(self.postings.get(key, ()))
         return results
 
-    def expire(self, active_history_size: int) -> None:
+    def expire(self, expired_event_ids) -> None:
         return None
 
 
@@ -248,14 +254,15 @@ def test_ordinary_fan_in_bound(monkeypatch) -> None:
     index.insert(target)
 
     incoming = index.ordinary_links("q")
-    assert len(incoming) == 2
+    assert len(incoming) == 1
     assert {link.successor_id for link in incoming} == {"q"}
+    assert [link.predecessor_id for link in incoming] == ["p3"]
 
 
 def test_skip_fan_in_bound(monkeypatch) -> None:
     index = build_index(monkeypatch)
     for i in range(5):
-        index.insert(make_event(f"a{i}", i, f"A{i}", anchor=True, aspects={"source_accumulation"}))
+        index.insert(make_event(f"a{i}", i, f"A{i}", beneficiary_id="shared", anchor=True, aspects={"source_accumulation"}))
 
     index.insert(make_event("base", 20, "shared", anchor=False, aspects={"routine"}))
     target = make_event("query", 21, "shared", beneficiary_id="B", anchor=False, aspects={"full_balance_transfer"})
@@ -264,6 +271,69 @@ def test_skip_fan_in_bound(monkeypatch) -> None:
     incoming = index.skip_links("query")
     assert len(incoming) == 2
     assert all(link.to_id == "query" for link in incoming)
+
+
+def test_enable_skip_links_flag_disables_skip_insertion(monkeypatch) -> None:
+    install_test_doubles(monkeypatch)
+    config = make_config()
+    config.construction.enable_skip_links = False
+    index = TimeIndex(config)
+
+    index.insert(make_event("p1", 1, "A", beneficiary_id="shared", anchor=True, aspects={"source_accumulation"}))
+    index.insert(make_event("q1", 2, "A", beneficiary_id="B", aspects={"full_balance_transfer"}))
+
+    assert index.skip_links("q1") == []
+
+
+def test_iso_time_strings_are_causal_in_construction(monkeypatch) -> None:
+    install_test_doubles(monkeypatch)
+    index = TimeIndex(make_config())
+
+    early = fake_featurize_event(
+        Event(
+            event_id="e1",
+            time="2025-01-01T00:00:00",
+            event_type="transaction",
+            attrs={"account_id": "A", "beneficiary_id": "B", "aspects": {"source_accumulation"}},
+        ),
+        None,
+    )
+    late = fake_featurize_event(
+        Event(
+            event_id="e2",
+            time="2025-01-01T01:00:00",
+            event_type="transaction",
+            attrs={"account_id": "A", "beneficiary_id": "C", "aspects": {"large_transfer"}},
+        ),
+        None,
+    )
+
+    assert index._is_causal_predecessor(early, late) is True
+
+
+def test_chain_candidate_with_missing_supporting_events_is_not_causal(monkeypatch) -> None:
+    index = build_index(monkeypatch)
+    target = fake_featurize_event(make_event("q", 3, "A", beneficiary_id="B", aspects={"large_transfer"}), None)
+    chain = ChainSummary(
+        chain_id="c-missing",
+        family="transaction_flow",
+        head_id="missing-1",
+        tail_id="missing-2",
+        representative_event_ids=["missing-1"],
+        source_entities={"x"},
+        destination_entities={"a"},
+        aspects={"generic_evidence"},
+    )
+
+    assert index._candidate_is_causal(chain, target) is False
+
+
+def test_rarity_is_populated_during_indexing(monkeypatch) -> None:
+    index = build_index(monkeypatch)
+    index.insert(make_event("e1", 1, "A", beneficiary_id="B", aspects={"source_accumulation"}))
+    record = index.insert(make_event("e2", 2, "A", beneficiary_id="B", aspects={"large_transfer"}))
+
+    assert 0.0 <= record.metadata.rarity <= 1.0
 
 
 def test_chain_bound(monkeypatch) -> None:
@@ -275,8 +345,10 @@ def test_chain_bound(monkeypatch) -> None:
     index.insert(target)
 
     chains = index.chains("tail")
-    assert len(chains) == 2
+    assert len(chains) == 1
     assert all(chain.tail_id == "tail" for chain in chains)
+    assert [chain.head_id for chain in chains] == ["c4"]
+    assert chains[0].representative_event_ids[-1] == "c4"
 
 
 def test_no_self_predecessor(monkeypatch) -> None:
@@ -287,6 +359,57 @@ def test_no_self_predecessor(monkeypatch) -> None:
 
     incoming = index.ordinary_links("self")
     assert all(link.predecessor_id != "self" for link in incoming)
+
+
+def test_no_future_predecessor_by_timestamp(monkeypatch) -> None:
+    index = build_index(monkeypatch)
+    index.insert(make_event("future_first", 10, "A", anchor=True, aspects={"source_accumulation"}))
+    index.insert(make_event("past_second", 4, "A", anchor=True, aspects={"source_accumulation"}))
+    index.insert(make_event("query", 6, "A", beneficiary_id="B", aspects={"large_transfer"}))
+
+    incoming = index.ordinary_links("query")
+
+    assert incoming
+    assert all(link.predecessor_id != "future_first" for link in incoming)
+    assert any(link.predecessor_id == "past_second" for link in incoming)
+
+
+def test_chain_summaries_store_supporting_history_only(monkeypatch) -> None:
+    index = build_index(monkeypatch)
+    index.insert(make_event("p1", 1, "A", anchor=True, aspects={"source_accumulation"}))
+    index.insert(make_event("q1", 2, "A", beneficiary_id="B", aspects={"large_transfer"}))
+
+    chains = index.chains("q1")
+
+    assert chains
+    assert all("q1" not in chain.representative_event_ids for chain in chains)
+    assert all(chain.representative_event_ids == ["p1"] for chain in chains)
+    assert all(chain.source_entities == {"a"} for chain in chains)
+    assert all(chain.destination_entities == set() for chain in chains)
+
+
+def test_forward_validation_uses_chain_supporting_event(monkeypatch) -> None:
+    index = build_index(monkeypatch)
+    source = make_event("p1", 1, "A", beneficiary_id="B", aspects={"source_accumulation"})
+    target = make_event("q1", 2, "B", beneficiary_id="C", aspects={"large_transfer"})
+    source_record = fake_featurize_event(source, None)
+    target_record = fake_featurize_event(target, None)
+    chain = ChainSummary(
+        chain_id="c1",
+        family="transaction_flow",
+        head_id="p1",
+        tail_id="missing-tail",
+        representative_event_ids=["p1"],
+        source_entities={"a"},
+        destination_entities={"b"},
+        aspects={"source_accumulation"},
+        dependency_confidence=0.8,
+        summary="transaction_flow chain from p1 to missing-tail",
+    )
+    index.event_store.insert(source_record)
+    index.event_store.insert(target_record)
+
+    assert index._forward_validates_skip_candidate(chain, target_record, []) is True
 
 
 def test_synthetic_transaction_sequence_creates_ordinary_and_skip_links(monkeypatch) -> None:
@@ -311,3 +434,252 @@ def test_synthetic_transaction_sequence_creates_ordinary_and_skip_links(monkeypa
     assert skip
     assert any(link.predecessor_id == "e6" for link in ordinary)
     assert any(link.from_id in {"e1", "e2", "e3", "e5"} for link in skip)
+
+
+def test_real_index_links_across_interacting_accounts() -> None:
+    config = TimeIndexConfig()
+    config.stores.ordinary_fan_in = 3
+    config.stores.skip_fan_in = 0
+    config.stores.active_history_size = 100
+    config.scoring.local_dependency_threshold = 0.30
+    config.scoring.time_decay = 1_000_000.0
+
+    index = TimeIndex(config)
+    events = [
+        Event(
+            event_id="e1",
+            time=1,
+            event_type="transfer",
+            attrs={
+                "src_account": "X",
+                "dst_account": "A",
+                "amount": 500.0,
+                "payment_format": "wire",
+                "currency": "USD",
+            },
+        ),
+        Event(
+            event_id="e2",
+            time=2,
+            event_type="transfer",
+            attrs={
+                "src_account": "A",
+                "dst_account": "B",
+                "amount": 500.0,
+                "payment_format": "wire",
+                "currency": "USD",
+            },
+        ),
+        Event(
+            event_id="q",
+            time=3,
+            event_type="transfer",
+            attrs={
+                "src_account": "B",
+                "dst_account": "C",
+                "amount": 500.0,
+                "payment_format": "wire",
+                "currency": "USD",
+            },
+        ),
+    ]
+
+    for event in events:
+        index.insert(event)
+
+    incoming = index.ordinary_links("q")
+    chains = index.chains("q")
+
+    assert any(link.predecessor_id == "e2" for link in incoming)
+    assert any(chain.family == "transaction_flow" for chain in chains)
+
+
+def test_real_timeindex_insert_and_expire_runtime_path() -> None:
+    config = TimeIndexConfig()
+    config.stores.active_history_size = 2
+    config.stores.posting_list_size = 10
+    config.stores.ordinary_fan_in = 2
+    config.stores.skip_fan_in = 2
+
+    index = TimeIndex(config)
+    index.insert(Event(event_id="e1", time=1, event_type="deposit", attrs={"account_id": "A", "amount": 100.0}))
+    index.insert(Event(event_id="e2", time=2, event_type="deposit", attrs={"account_id": "A", "amount": 200.0}))
+    index.insert(Event(event_id="e3", time=3, event_type="transfer", attrs={"account_id": "A", "amount": 200.0}))
+
+    assert index.get_event("e1") is None
+    assert index.get_event("e2") is not None
+    assert index.get_event("e3") is not None
+
+
+def test_real_local_candidates_keep_latest_same_entity_and_latest_bridge() -> None:
+    config = TimeIndexConfig()
+    config.stores.posting_list_size = 20
+    config.stores.active_history_size = 100
+    config.stores.skip_fan_in = 0
+
+    index = TimeIndex(config)
+    history = [
+        Event(
+            event_id="same_old",
+            time=1,
+            event_type="transfer",
+            attrs={"src_account": "A", "dst_account": "M", "amount": 100.0, "payment_format": "wire", "currency": "USD"},
+        ),
+        Event(
+            event_id="same_new",
+            time=2,
+            event_type="transfer",
+            attrs={"src_account": "A", "dst_account": "N", "amount": 100.0, "payment_format": "wire", "currency": "USD"},
+        ),
+        Event(
+            event_id="bridge_old",
+            time=3,
+            event_type="transfer",
+            attrs={"src_account": "X", "dst_account": "A", "amount": 100.0, "payment_format": "wire", "currency": "USD"},
+        ),
+        Event(
+            event_id="bridge_new",
+            time=4,
+            event_type="transfer",
+            attrs={"src_account": "Y", "dst_account": "A", "amount": 100.0, "payment_format": "wire", "currency": "USD"},
+        ),
+    ]
+
+    for event in history:
+        index.insert(event)
+
+    query = Event(
+        event_id="q",
+        time=5,
+        event_type="transfer",
+        attrs={"src_account": "A", "dst_account": "Z", "amount": 100.0, "payment_format": "wire", "currency": "USD"},
+    )
+    record = index._featurize_event(query)
+    candidates = index._local_candidate_records(record)
+
+    assert [candidate.event.event_id for candidate in candidates] == ["bridge_new", "same_new"]
+
+
+def test_real_local_candidates_use_entity_directory_before_generic_lookup() -> None:
+    config = TimeIndexConfig()
+    config.stores.posting_list_size = 20
+    config.stores.active_history_size = 100
+    config.stores.skip_fan_in = 0
+
+    index = TimeIndex(config)
+    index.insert(
+        Event(
+            event_id="same_new",
+            time=2,
+            event_type="transfer",
+            attrs={"src_account": "A", "dst_account": "N", "amount": 100.0, "payment_format": "wire", "currency": "USD"},
+        )
+    )
+    index.insert(
+        Event(
+            event_id="bridge_new",
+            time=4,
+            event_type="transfer",
+            attrs={"src_account": "Y", "dst_account": "A", "amount": 100.0, "payment_format": "wire", "currency": "USD"},
+        )
+    )
+
+    query = Event(
+        event_id="q",
+        time=5,
+        event_type="transfer",
+        attrs={"src_account": "A", "dst_account": "Z", "amount": 100.0, "payment_format": "wire", "currency": "USD"},
+    )
+    record = index._featurize_event(query)
+    candidates = index._entity_candidate_records(record)
+
+    assert [candidate.event.event_id for candidate in candidates] == ["same_new", "bridge_new"]
+
+
+def test_real_local_candidates_keep_latest_bridge_per_bridged_entity() -> None:
+    config = TimeIndexConfig()
+    config.stores.posting_list_size = 30
+    config.stores.active_history_size = 100
+    config.stores.skip_fan_in = 0
+
+    index = TimeIndex(config)
+    history = [
+        Event(
+            event_id="bridge_account",
+            time=1,
+            event_type="transfer",
+            attrs={"src_account": "X", "dst_account": "A", "amount": 100.0, "payment_format": "wire", "currency": "USD"},
+        ),
+        Event(
+            event_id="bridge_user",
+            time=2,
+            event_type="transfer",
+            attrs={"src_account": "Y", "dst_user": "user_1", "amount": 100.0, "payment_format": "wire", "currency": "USD"},
+        ),
+    ]
+
+    for event in history:
+        index.insert(event)
+
+    query = Event(
+        event_id="q",
+        time=3,
+        event_type="transfer",
+        attrs={
+            "src_account": "A",
+            "src_user": "user_1",
+            "dst_account": "Z",
+            "amount": 100.0,
+            "payment_format": "wire",
+            "currency": "USD",
+        },
+    )
+    record = index._featurize_event(query)
+    candidates = index._local_candidate_records(record)
+
+    assert [candidate.event.event_id for candidate in candidates] == ["bridge_user", "bridge_account"]
+
+
+def test_real_local_candidates_keep_latest_fallback_after_prefilter() -> None:
+    config = TimeIndexConfig()
+    config.stores.posting_list_size = 20
+    config.stores.active_history_size = 100
+    config.stores.skip_fan_in = 0
+    config.extractor.time_bucket_width = 100
+
+    index = TimeIndex(config)
+    index.insert(Event(event_id="old", time=1, event_type="heartbeat", attrs={"status": "ok"}, text="steady"))
+    index.insert(Event(event_id="new", time=2, event_type="heartbeat", attrs={"status": "warn"}, text="drift"))
+
+    query = Event(
+        event_id="q",
+        time=3,
+        event_type="heartbeat",
+        attrs={"status": "critical"},
+        text="outage",
+    )
+    record = index._featurize_event(query)
+    candidates = index._local_candidate_records(record)
+
+    assert [candidate.event.event_id for candidate in candidates] == ["new"]
+
+
+def test_real_ordinary_link_tie_break_prefers_more_recent_candidate() -> None:
+    config = TimeIndexConfig()
+    config.stores.ordinary_fan_in = 1
+    config.stores.skip_fan_in = 0
+    config.stores.active_history_size = 100
+    config.scoring.local_dependency_threshold = 0.0
+    config.scoring.time_decay = 1_000_000.0
+
+    index = TimeIndex(config)
+    older = Event(event_id="older", time=1, event_type="heartbeat", attrs={"status": "ok"}, text="steady")
+    newer = Event(event_id="newer", time=2, event_type="heartbeat", attrs={"status": "ok"}, text="steady")
+    query = Event(event_id="q", time=3, event_type="heartbeat", attrs={"status": "ok"}, text="steady")
+
+    index.insert(older)
+    index.insert(newer)
+    index.insert(query)
+
+    incoming = index.ordinary_links("q")
+    assert [link.predecessor_id for link in incoming] == ["newer"]

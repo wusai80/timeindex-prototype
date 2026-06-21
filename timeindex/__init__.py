@@ -20,6 +20,7 @@ from .event import (
     OrdinaryLink,
     SkipLink,
 )
+from .sqlite_backend import SqliteTimeIndexBackend, export_sqlite_backend
 
 __all__ = [
     "ChainSummary",
@@ -34,8 +35,10 @@ __all__ = [
     "OrdinaryLink",
     "RetrievalConfig",
     "ScoringConfig",
+    "SqliteTimeIndexBackend",
     "SkipLink",
     "StoreConfig",
     "SyntheticConfig",
     "TimeIndexConfig",
+    "export_sqlite_backend",
 ]

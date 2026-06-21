@@ -24,6 +24,76 @@ This scaffold currently includes:
 - deterministic synthetic examples and simple baselines
 - core online indexing and retrieval algorithms still under active implementation
 
+## IBM AML Benchmark
+
+The repository now includes a lightweight IBM AML benchmark harness under `benchmarks/ibm_aml/`. The benchmark is centered on budgeted temporal evidence retrieval, not just fraud classification:
+
+- retrieve compact historical supporting evidence for each suspicious query transaction
+- keep all evidence temporally causal so no returned item occurs after the query
+- report evidence recall, precision, context efficiency, latency, and update throughput
+
+Expected dataset layout:
+
+```text
+data/
+  ibm_aml/
+    *.csv
+```
+
+Quick start:
+
+```bash
+python benchmarks/ibm_aml/profile_dataset.py --path data/ibm_aml/sample.csv
+python benchmarks/ibm_aml/run_timeindex.py data/ibm_aml/sample.csv
+python benchmarks/ibm_aml/run_ablations.py --path data/ibm_aml/sample.csv
+```
+
+The benchmark writes artifacts under `outputs/ibm_aml/` and `outputs/ibm_aml/ablations/`.
+
+Important output files:
+
+- `outputs/ibm_aml/retrieval_results.jsonl`: per-query retrieval results
+- `outputs/ibm_aml/config.json`: benchmark and TimeIndex config snapshot
+- `outputs/ibm_aml/dataset_profile.json`: high-level dataset statistics
+- `outputs/ibm_aml/run_summary.json`: run summary and latency stats
+- `outputs/ibm_aml/ablations/*.jsonl`: one JSONL file per retrieval variant
+- `outputs/ibm_aml/ablations/aggregate.csv`: recall, precision, F1, latency, and context efficiency by variant and budget
+
+To generate plots from `aggregate.csv`, use a short Python snippet:
+
+```python
+import csv
+
+from benchmarks.plots import (
+    plot_ablation_bars,
+    plot_context_efficiency,
+    plot_latency_vs_budget,
+    plot_precision_at_budget,
+    plot_recall_at_budget,
+)
+
+with open("outputs/ibm_aml/ablations/aggregate.csv", "r", encoding="utf-8", newline="") as handle:
+    rows = list(csv.DictReader(handle))
+
+full_rows = [row for row in rows if row["variant"] == "timeindex_full"]
+plot_recall_at_budget(full_rows, "outputs/ibm_aml/plots/recall")
+plot_precision_at_budget(full_rows, "outputs/ibm_aml/plots/precision")
+plot_context_efficiency(full_rows, "outputs/ibm_aml/plots/context_efficiency")
+plot_latency_vs_budget(full_rows, "outputs/ibm_aml/plots/latency")
+plot_ablation_bars(
+    [
+        {"name": row["variant"].replace("_", " "), "score": float(row["recall"])}
+        for row in rows
+        if row["budget"] == "5"
+    ],
+    "outputs/ibm_aml/plots/ablation_recall_b5",
+)
+```
+
+Minimal expected result:
+
+- on the built-in synthetic sanity path, `timeindex_full` should beat `chain_only` on Evidence Recall@small budget because skip evidence can recover earlier accumulation context that ordinary chains alone may miss
+
 ## Package Layout
 
 ```text

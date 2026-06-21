@@ -1,4 +1,5 @@
 import math
+from types import MappingProxyType
 
 import numpy as np
 
@@ -34,6 +35,10 @@ def test_extract_keys_covers_entity_attr_context_type_and_time_block() -> None:
     assert "time_block:2" in keys
     assert "entity:src_account=acct_a" in keys
     assert "entity:dst_user=user_b" in keys
+    assert "participant:acct_a" in keys
+    assert "flow_src:acct_a" in keys
+    assert "flow_dst:user_b" in keys
+    assert "flow_pair:acct_a->user_b" in keys
     assert "attr:status=approved" in keys
     assert "attr_bin:amount=10^3" in keys
     assert "ctx:region=us-east" in keys
@@ -122,3 +127,64 @@ def test_featurize_event_builds_complete_event_record() -> None:
     assert extracted.lookup_keys == record.lookup_keys
     assert np.allclose(extracted.sketch, record.sketch)
     assert extracted.aspects == record.aspects
+
+
+def test_featurize_event_precomputes_cached_subsets_and_flow_entities() -> None:
+    config = ExtractorConfig(sketch_dim=16, time_bucket_width=50)
+    event = Event(
+        event_id="e6",
+        time=125,
+        event_type="transfer",
+        attrs={
+            "src_account": "acct_a",
+            "beneficiary_id": "acct_b",
+            "amount": 1200,
+            "payment_format": "wire",
+        },
+        ctx={"region": "us"},
+        text="wire transfer",
+    )
+
+    record = featurize_event(event, config)
+
+    assert "entity:src_account=acct_a" in record.entity_keys
+    assert "entity:beneficiary_id=acct_b" in record.entity_keys
+    assert "attr_bin:amount=10^3" in record.attribute_keys
+    assert "attr:payment_format=wire" in record.attribute_keys
+    assert "ctx:region=us" in record.context_keys
+    assert "type:transfer" in record.context_keys
+    assert "time_block:2" in record.context_keys
+    assert record.source_entities == frozenset({"acct_a"})
+    assert record.destination_entities == frozenset({"acct_b"})
+    assert record.participant_entities == frozenset({"acct_a", "acct_b"})
+    assert record.sketch_is_normalized is True
+    assert isinstance(record.event.attrs, MappingProxyType)
+    assert isinstance(record.event.ctx, MappingProxyType)
+    assert isinstance(record.lookup_keys, frozenset)
+    assert isinstance(record.aspects, frozenset)
+    assert record.sketch.flags.writeable is False
+
+
+def test_extract_keys_does_not_treat_bank_columns_as_entity_endpoints() -> None:
+    event = Event(
+        event_id="e7",
+        time=10,
+        event_type="transfer",
+        attrs={
+            "src_account": "acct_a",
+            "dst_account": "acct_b",
+            "src_bank": "bank_1",
+            "dst_bank": "bank_1",
+        },
+    )
+
+    keys = extract_keys(event, ExtractorConfig())
+
+    assert "entity:src_account=acct_a" in keys
+    assert "entity:dst_account=acct_b" in keys
+    assert "entity:src_bank=bank_1" not in keys
+    assert "entity:dst_bank=bank_1" not in keys
+    assert "ctx:src_bank=bank_1" not in keys
+    assert "ctx:dst_bank=bank_1" not in keys
+    assert "attr:src_bank=bank_1" in keys
+    assert "attr:dst_bank=bank_1" in keys

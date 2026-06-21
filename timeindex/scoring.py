@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from datetime import datetime
 from math import exp
 from typing import Any
 
@@ -24,8 +25,93 @@ def _as_set(values: Iterable[str] | None) -> set[str]:
     return set(values)
 
 
-def _key_subset(record: EventRecord, prefixes: tuple[str, ...]) -> set[str]:
-    return {key for key in record.lookup_keys if key.startswith(prefixes)}
+def _flow_entities(record: EventRecord) -> tuple[set[str], set[str]]:
+    return set(record.source_entities), set(record.destination_entities)
+
+
+def _flow_continuity(candidate: EventRecord, target: EventRecord) -> float:
+    candidate_source, candidate_destination = _flow_entities(candidate)
+    target_source, target_destination = _flow_entities(target)
+    participant_candidate = candidate_source | candidate_destination
+    participant_target = target_source | target_destination
+
+    handoff = jaccard(candidate_destination, target_source)
+    source_reuse = jaccard(candidate_source, target_source)
+    destination_reuse = jaccard(candidate_destination, target_destination)
+    participant_overlap = jaccard(participant_candidate, participant_target)
+    return _clip01(max(handoff, source_reuse, destination_reuse, participant_overlap))
+
+
+def _participant_bridge_score(
+    anchor: EventRecord | ChainSummary | EvidenceObject | SkipLink,
+    target: EventRecord,
+    ordinary_predecessors: Sequence[EventRecord | ChainSummary | EvidenceObject | SkipLink],
+) -> float:
+    anchor_source, anchor_destination = _object_flow_entities(anchor)
+    if not (anchor_source or anchor_destination):
+        return 0.0
+
+    target_source, target_destination = _flow_entities(target)
+    direct = 0.0
+    if anchor_destination & target_source:
+        direct = 1.0
+    elif anchor_source & target_source:
+        direct = 0.75
+    elif anchor_destination & target_destination:
+        direct = 0.60
+    elif anchor_source & target_destination:
+        direct = 0.50
+
+    forward = direct
+    for predecessor in ordinary_predecessors:
+        pred_source, pred_destination = _object_flow_entities(predecessor)
+        if anchor_destination & pred_source:
+            forward = max(forward, 1.0)
+        elif anchor_source & pred_source:
+            forward = max(forward, 0.80)
+        elif anchor_destination & pred_destination:
+            forward = max(forward, 0.65)
+        elif anchor_source & pred_destination:
+            forward = max(forward, 0.50)
+    return _clip01(forward)
+
+
+def _object_flow_entities(
+    obj: EventRecord | ChainSummary | EvidenceObject | SkipLink,
+) -> tuple[set[str], set[str]]:
+    if isinstance(obj, EventRecord):
+        return set(obj.source_entities), set(obj.destination_entities)
+    if isinstance(obj, ChainSummary):
+        return set(getattr(obj, "source_entities", ())), set(getattr(obj, "destination_entities", ()))
+    if isinstance(obj, SkipLink):
+        return set(getattr(obj, "source_entities", ())), set(getattr(obj, "destination_entities", ()))
+    return set(), set()
+
+
+def _generic_anchor_penalty(anchor: EventRecord | ChainSummary | EvidenceObject | SkipLink) -> float:
+    aspects = _object_aspects(anchor)
+    if not aspects:
+        return 0.15
+    if aspects == {"generic_evidence"}:
+        return 0.20
+    if "generic_evidence" in aspects and len(aspects) == 1:
+        return 0.20
+    return 0.0
+
+
+def _has_transaction_continuity(candidate: EventRecord, target: EventRecord) -> bool:
+    candidate_source, candidate_destination = _flow_entities(candidate)
+    target_source, target_destination = _flow_entities(target)
+    if not (candidate_source or candidate_destination):
+        return False
+    if not (target_source or target_destination):
+        return False
+    return bool(
+        (candidate_destination & target_source)
+        or (candidate_source & target_source)
+        or (candidate_destination & target_destination)
+        or (candidate_source & target_destination)
+    )
 
 
 def _event_time(record: EventRecord) -> float | None:
@@ -36,7 +122,14 @@ def _event_time(record: EventRecord) -> float | None:
         try:
             return float(raw_time)
         except ValueError:
-            return None
+            pass
+        text = raw_time.strip()
+        for candidate in (text, text.replace("Z", "+00:00"), text.replace("/", "-")):
+            try:
+                return datetime.fromisoformat(candidate).timestamp()
+            except ValueError:
+                continue
+        return None
     return None
 
 
@@ -55,6 +148,15 @@ def _vector_similarity(left: np.ndarray | None, right: np.ndarray | None) -> flo
     if left is None or right is None:
         return 0.0
     return cosine(left, right)
+
+
+def _record_vector_similarity(left: EventRecord, right: EventRecord) -> float:
+    if left.sketch is None or right.sketch is None:
+        return 0.0
+    if left.sketch_is_normalized and right.sketch_is_normalized:
+        score = float(np.dot(left.sketch, right.sketch))
+        return _clip01((score + 1.0) / 2.0)
+    return _vector_similarity(left.sketch, right.sketch)
 
 
 def _event_ids(obj: Any) -> set[str]:
@@ -76,6 +178,18 @@ def _object_aspects(obj: Any) -> set[str]:
 def _object_cost(obj: Any) -> float:
     raw_cost = getattr(obj, "cost", 1.0)
     return max(float(raw_cost), 0.0)
+
+
+def _object_rarity(obj: Any) -> float:
+    if isinstance(obj, EventRecord):
+        return _clip01(max(obj.metadata.rarity, obj.metadata.surprise))
+    if isinstance(obj, ChainSummary):
+        return _clip01(obj.dependency_confidence)
+    return 0.0
+
+
+def _chain_head_bonus(obj: Any) -> float:
+    return 1.0 if isinstance(obj, ChainSummary) else 0.0
 
 
 def _weighted_overlap(values: set[str], intent: DecisionIntent) -> float:
@@ -105,6 +219,44 @@ def _novelty_against_existing(obj: Any, existing_objects: Sequence[Any]) -> floa
     if not overlaps:
         return 1.0
     return _clip01(1.0 - max(overlaps))
+
+
+def _redundancy_against_existing(obj: Any, existing_objects: Sequence[Any]) -> float:
+    if not existing_objects:
+        return 0.0
+    object_aspects = _object_aspects(obj)
+    if not object_aspects:
+        return 0.0
+    overlaps = [jaccard(object_aspects, _object_aspects(existing)) for existing in existing_objects]
+    return max(overlaps, default=0.0)
+
+
+def _paper_correlation(anchor: EventRecord | ChainSummary | EvidenceObject | SkipLink, target: EventRecord) -> float:
+    if isinstance(anchor, EventRecord):
+        return _record_vector_similarity(anchor, target)
+    anchor_vector = getattr(anchor, "sketch", None)
+    if anchor_vector is not None:
+        return _vector_similarity(anchor_vector, target.sketch)
+    return 0.0
+
+
+def _paper_event_value(
+    anchor: EventRecord | ChainSummary | EvidenceObject | SkipLink,
+    target: EventRecord,
+    intent: DecisionIntent,
+    config: ScoringConfig,
+) -> float:
+    corr = _paper_correlation(anchor, target)
+    if isinstance(anchor, EventRecord):
+        approx_dependency = dependency_score(anchor, target, config)
+    else:
+        approx_dependency = _clip01(0.5 * corr + 0.5 * impact_score(anchor, intent))
+    return _clip01(
+        0.40 * approx_dependency
+        + 0.30 * impact_score(anchor, intent)
+        + 0.20 * _object_rarity(anchor)
+        + 0.10 * corr
+    )
 
 
 def jaccard(set_a: Iterable[str] | None, set_b: Iterable[str] | None) -> float:
@@ -161,20 +313,20 @@ def rarity_score(event: EventRecord, key_frequencies: dict[str, int], history_si
 def dependency_score(candidate: EventRecord, target: EventRecord, config: ScoringConfig) -> float:
     """Score a local predecessor relationship using weighted normalized features."""
 
-    entity_overlap = jaccard(
-        _key_subset(candidate, ("entity:",)),
-        _key_subset(target, ("entity:",)),
-    )
-    attribute_overlap = jaccard(
-        _key_subset(candidate, ("attr:", "binned:")),
-        _key_subset(target, ("attr:", "binned:")),
-    )
-    context_overlap = jaccard(
-        _key_subset(candidate, ("ctx:", "type:", "time:")),
-        _key_subset(target, ("ctx:", "type:", "time:")),
-    )
+    if (
+        candidate.participant_entities
+        and target.participant_entities
+        and not _has_transaction_continuity(candidate, target)
+    ):
+        return 0.0
+
+    exact_entity_overlap = jaccard(candidate.entity_keys, target.entity_keys)
+    flow_overlap = _flow_continuity(candidate, target)
+    entity_overlap = max(exact_entity_overlap, flow_overlap)
+    attribute_overlap = jaccard(candidate.attribute_keys, target.attribute_keys)
+    context_overlap = jaccard(candidate.context_keys, target.context_keys)
     temporal_score = _time_decay(candidate, target, config)
-    vector_score = _vector_similarity(candidate.sketch, target.sketch)
+    vector_score = _record_vector_similarity(candidate, target)
     deviation_score = _clip01(max(candidate.metadata.rarity, candidate.metadata.surprise))
 
     score = (
@@ -208,9 +360,12 @@ def anchor_score(
     """Score an event or chain as a candidate skip anchor."""
 
     score = (
-        0.45 * impact_score(object, intent)
-        + 0.35 * coverage_score(object, intent)
-        + 0.20 * _novelty_against_existing(object, existing_anchors)
+        0.30 * _object_rarity(object)
+        + 0.30 * impact_score(object, intent)
+        + 0.20 * coverage_score(object, intent)
+        + 0.10 * _chain_head_bonus(object)
+        - 0.10 * _redundancy_against_existing(object, existing_anchors)
+        - _generic_anchor_penalty(object)
     )
     return _clip01(score)
 
@@ -224,16 +379,28 @@ def skip_score(
 ) -> float:
     """Score a long-range skip link candidate against a target event."""
 
-    if isinstance(anchor, EventRecord):
-        relevance = dependency_score(anchor, target, config)
-    else:
-        relevance = _weighted_overlap(_object_aspects(anchor), intent)
+    corr = _paper_correlation(anchor, target)
+    impact = impact_score(anchor, intent)
+    novelty = _novelty_against_existing(anchor, ordinary_predecessors)
+    anchor_value = _paper_event_value(anchor, target, intent, config)
+    ordinary_values = [
+        _paper_event_value(predecessor, target, intent, config)
+        for predecessor in ordinary_predecessors
+    ]
+    best_ordinary_value = max(ordinary_values, default=0.0)
+    bridge = _clip01(max(0.0, anchor_value - best_ordinary_value))
+    participant_bridge = _participant_bridge_score(anchor, target, ordinary_predecessors)
+    cost = _clip01(_object_cost(anchor))
+    generic_penalty = _generic_anchor_penalty(anchor)
 
     score = (
-        0.40 * impact_score(anchor, intent)
-        + 0.25 * coverage_score(anchor, intent)
-        + 0.20 * relevance
-        + 0.15 * _novelty_against_existing(anchor, ordinary_predecessors)
+        0.20 * corr
+        + 0.20 * impact
+        + 0.15 * novelty
+        + 0.25 * bridge
+        + 0.20 * participant_bridge
+        - 0.10 * cost
+        - generic_penalty
     )
     return _clip01(score)
 

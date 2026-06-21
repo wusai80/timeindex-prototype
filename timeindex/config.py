@@ -51,6 +51,13 @@ class ConstructionConfig:
 
     maintain_outgoing_links: bool = True
     expire_stale_items: bool = True
+    enable_skip_links: bool = True
+    enable_bridge_score: bool = True
+    enable_aspect_candidates: bool = True
+    enable_rare_candidates: bool = True
+    enable_correlation_candidates: bool = True
+    skip_candidate_pool_factor: int = 3
+    skip_summary_event_limit: int = 4
     options: dict[str, Any] = field(default_factory=dict)
 
 
@@ -62,6 +69,12 @@ class RetrievalConfig:
     allow_skip_expansion: bool = True
     default_budget: int = 10
     priority_epsilon: float = 1e-8
+    max_frontier_size: int = 64
+    max_branch_factor: int = 3
+    max_search_expansions: int = 64
+    max_depth: int = 4
+    skip_competitive_ratio: float = 0.9
+    hot_cache_size: int = 2048
     options: dict[str, Any] = field(default_factory=dict)
 
 

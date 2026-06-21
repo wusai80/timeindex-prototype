@@ -25,11 +25,12 @@ def _record(
     keys: set[str],
     aspects: set[str],
     vector: list[float],
+    attrs: dict[str, object] | None = None,
     rarity: float = 0.0,
     surprise: float = 0.0,
 ) -> EventRecord:
     return EventRecord(
-        event=Event(event_id=event_id, time=time, event_type="transaction"),
+        event=Event(event_id=event_id, time=time, event_type="transaction", attrs=attrs or {}),
         lookup_keys=keys,
         sketch=np.array(vector, dtype=float),
         aspects=aspects,
@@ -47,6 +48,28 @@ def test_cosine_range_and_zero_vector_behavior() -> None:
     assert cosine(np.array([1.0, 0.0]), np.array([1.0, 0.0])) == 1.0
     assert cosine(np.array([1.0, 0.0]), np.array([-1.0, 0.0])) == 0.0
     assert cosine(np.array([0.0, 0.0]), np.array([1.0, 0.0])) == 0.0
+
+
+def test_dependency_score_supports_iso_datetime_strings() -> None:
+    config = ScoringConfig(time_decay=3600.0)
+    early = _record(
+        "early",
+        "2025-01-01T00:00:00",  # type: ignore[arg-type]
+        keys={"entity:account:a", "type:transfer"},
+        aspects={"large_transfer"},
+        vector=[1.0, 0.0, 0.0],
+        attrs={"src_account": "A", "dst_account": "B"},
+    )
+    late = _record(
+        "late",
+        "2025-01-01T00:10:00",  # type: ignore[arg-type]
+        keys={"entity:account:a", "type:transfer"},
+        aspects={"large_transfer"},
+        vector=[1.0, 0.0, 0.0],
+        attrs={"src_account": "A", "dst_account": "C"},
+    )
+
+    assert dependency_score(early, late, config) > 0.0
 
 
 def test_rarity_score_prefers_rare_keys() -> None:
@@ -126,6 +149,168 @@ def test_dependency_score_is_higher_for_more_similar_events() -> None:
     assert near_score > far_score
 
 
+def test_dependency_score_counts_attr_bin_overlap() -> None:
+    config = ScoringConfig(time_decay=10.0)
+    target = _record(
+        "target",
+        10.0,
+        keys={"entity:account:a", "attr_bin:amount=10^3", "type:transfer"},
+        aspects={"large_transfer"},
+        vector=[1.0, 0.0, 0.0],
+    )
+    matching = _record(
+        "matching",
+        9.0,
+        keys={"entity:account:a", "attr_bin:amount=10^3", "type:transfer"},
+        aspects={"large_transfer"},
+        vector=[1.0, 0.0, 0.0],
+    )
+    different = _record(
+        "different",
+        9.0,
+        keys={"entity:account:a", "attr_bin:amount=10^1", "type:transfer"},
+        aspects={"large_transfer"},
+        vector=[1.0, 0.0, 0.0],
+    )
+
+    assert dependency_score(matching, target, config) > dependency_score(different, target, config)
+
+
+def test_dependency_score_rewards_cross_account_handoff_continuity() -> None:
+    config = ScoringConfig(time_decay=10.0)
+    predecessor = _record(
+        "pred",
+        9.0,
+        keys={
+            "entity:src_account=a",
+            "entity:dst_account=b",
+            "participant:a",
+            "participant:b",
+            "flow_src:a",
+            "flow_dst:b",
+            "flow_pair:a->b",
+            "attr:payment_format=ach",
+            "ctx:currency=usd",
+        },
+        attrs={"src_account": "A", "dst_account": "B", "payment_format": "ach", "currency": "USD"},
+        aspects={"generic_evidence"},
+        vector=[1.0, 0.0, 0.0],
+    )
+    target = _record(
+        "target",
+        10.0,
+        keys={
+            "entity:src_account=b",
+            "entity:dst_account=c",
+            "participant:b",
+            "participant:c",
+            "flow_src:b",
+            "flow_dst:c",
+            "flow_pair:b->c",
+            "attr:payment_format=ach",
+            "ctx:currency=usd",
+        },
+        attrs={"src_account": "B", "dst_account": "C", "payment_format": "ach", "currency": "USD"},
+        aspects={"generic_evidence"},
+        vector=[1.0, 0.0, 0.0],
+    )
+    unrelated = _record(
+        "other",
+        9.0,
+        keys={
+            "entity:src_account=x",
+            "entity:dst_account=y",
+            "participant:x",
+            "participant:y",
+            "flow_src:x",
+            "flow_dst:y",
+            "flow_pair:x->y",
+            "attr:payment_format=ach",
+            "ctx:currency=usd",
+        },
+        attrs={"src_account": "X", "dst_account": "Y", "payment_format": "ach", "currency": "USD"},
+        aspects={"generic_evidence"},
+        vector=[1.0, 0.0, 0.0],
+    )
+
+    assert dependency_score(predecessor, target, config) > dependency_score(unrelated, target, config)
+
+
+def test_dependency_score_rejects_same_bank_without_account_continuity() -> None:
+    config = ScoringConfig(time_decay=10.0)
+    candidate = _record(
+        "candidate",
+        9.0,
+        keys={
+            "entity:transaction_id=candidate",
+            "attr:src_bank=bank_1",
+            "attr:dst_bank=bank_1",
+            "participant:a",
+            "participant:b",
+            "flow_src:a",
+            "flow_dst:b",
+            "flow_pair:a->b",
+        },
+        attrs={"src_account": "A", "dst_account": "B", "src_bank": "BANK_1", "dst_bank": "BANK_1"},
+        aspects={"generic_evidence"},
+        vector=[1.0, 0.0, 0.0],
+    )
+    target = _record(
+        "target",
+        10.0,
+        keys={
+            "entity:transaction_id=target",
+            "attr:src_bank=bank_1",
+            "attr:dst_bank=bank_1",
+            "participant:c",
+            "participant:d",
+            "flow_src:c",
+            "flow_dst:d",
+            "flow_pair:c->d",
+        },
+        attrs={"src_account": "C", "dst_account": "D", "src_bank": "BANK_1", "dst_bank": "BANK_1"},
+        aspects={"generic_evidence"},
+        vector=[1.0, 0.0, 0.0],
+    )
+
+    assert dependency_score(candidate, target, config) == 0.0
+
+
+def test_dependency_score_uses_normalized_sketch_similarity_without_changing_range() -> None:
+    config = ScoringConfig(time_decay=10.0)
+    target = _record(
+        "target",
+        10.0,
+        keys={"entity:account:a", "type:transfer"},
+        aspects={"large_transfer"},
+        vector=[1.0, 0.0, 0.0],
+    )
+    aligned = _record(
+        "aligned",
+        9.0,
+        keys={"entity:account:a", "type:transfer"},
+        aspects={"large_transfer"},
+        vector=[1.0, 0.0, 0.0],
+    )
+    orthogonal = _record(
+        "orthogonal",
+        9.0,
+        keys={"entity:account:a", "type:transfer"},
+        aspects={"large_transfer"},
+        vector=[0.0, 1.0, 0.0],
+    )
+
+    aligned_score = dependency_score(aligned, target, config)
+    orthogonal_score = dependency_score(orthogonal, target, config)
+
+    assert target.sketch_is_normalized is True
+    assert aligned.sketch_is_normalized is True
+    assert orthogonal.sketch_is_normalized is True
+    assert 0.0 <= aligned_score <= 1.0
+    assert 0.0 <= orthogonal_score <= 1.0
+    assert aligned_score > orthogonal_score
+
+
 def test_impact_and_coverage_reflect_intent_overlap() -> None:
     intent = DecisionIntent(
         aspects={"large_transfer", "beneficiary_novelty"},
@@ -179,6 +364,80 @@ def test_anchor_and_skip_scores_are_normalized_and_reward_novelty() -> None:
     assert 0.0 <= repeated_anchor_score <= 1.0
     assert 0.0 <= skip_value <= 1.0
     assert fresh_anchor_score > repeated_anchor_score
+
+
+def test_skip_score_rewards_anchor_that_bridges_into_query_source() -> None:
+    config = ScoringConfig(time_decay=10.0)
+    intent = DecisionIntent(aspects={"source_accumulation", "full_balance_transfer"})
+    target = _record(
+        "target",
+        10.0,
+        keys={
+            "entity:src_account=a",
+            "entity:dst_account=b",
+            "participant:a",
+            "participant:b",
+            "flow_src:a",
+            "flow_dst:b",
+            "flow_pair:a->b",
+        },
+        aspects={"full_balance_transfer"},
+        vector=[1.0, 0.0, 1.0],
+        attrs={"src_account": "A", "dst_account": "B"},
+    )
+    bridged_anchor = _record(
+        "anchor1",
+        4.0,
+        keys={
+            "entity:src_account=x",
+            "entity:dst_account=a",
+            "participant:x",
+            "participant:a",
+            "flow_src:x",
+            "flow_dst:a",
+            "flow_pair:x->a",
+        },
+        aspects={"source_accumulation"},
+        vector=[1.0, 0.0, 1.0],
+        attrs={"src_account": "X", "dst_account": "A"},
+    )
+    weak_anchor = _record(
+        "anchor2",
+        4.0,
+        keys={
+            "entity:src_account=m",
+            "entity:dst_account=n",
+            "participant:m",
+            "participant:n",
+            "flow_src:m",
+            "flow_dst:n",
+            "flow_pair:m->n",
+        },
+        aspects={"generic_evidence"},
+        vector=[1.0, 0.0, 1.0],
+        attrs={"src_account": "M", "dst_account": "N"},
+    )
+    local_predecessor = _record(
+        "pred",
+        9.0,
+        keys={
+            "entity:src_account=a",
+            "entity:dst_account=b",
+            "participant:a",
+            "participant:b",
+            "flow_src:a",
+            "flow_dst:b",
+            "flow_pair:a->b",
+        },
+        aspects={"generic_evidence"},
+        vector=[1.0, 0.0, 1.0],
+        attrs={"src_account": "A", "dst_account": "B"},
+    )
+
+    bridged_score = skip_score(bridged_anchor, target, intent, ordinary_predecessors=[local_predecessor], config=config)
+    weak_score = skip_score(weak_anchor, target, intent, ordinary_predecessors=[local_predecessor], config=config)
+
+    assert bridged_score > weak_score
 
 
 def test_retrieval_marginal_utility_and_priority_are_bounded_and_cost_aware() -> None:

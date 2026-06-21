@@ -1,0 +1,367 @@
+TimeIndex hybrid implementation notes for future paper update
+=============================================================
+
+Goal
+----
+We kept the efficient construction and ordinary-link optimizations from the current implementation,
+while moving anchor scoring and skip-link scoring closer to the paper draft.
+
+What we intentionally kept from the current implementation
+----------------------------------------------------------
+1. Ordinary candidate generation is optimized.
+   - We do not look up every key in K_t.
+   - We primarily use entity/flow-related keys, deduplicate, and prefilter before full scoring.
+   - We also apply latest-only pruning:
+     - latest prior event per same-role entity
+     - latest prior event per bridged entity
+     - recent fallback if nothing survives
+   - Reason: this is much more scalable for large streaming workloads.
+
+2. Ordinary dependency scoring keeps flow continuity.
+   - The code keeps the current enhanced ordinary score logic:
+     - exact entity overlap
+     - flow continuity for transaction-style chains
+     - attribute/context/time/vector/deviation terms
+   - Reason: this is more reasonable for transaction evidence than pure entity-key Jaccard alone.
+
+3. Vector similarity uses a fast normalized dot-product path.
+   - If sketches are already normalized, we use the dot product directly.
+   - Reason: equivalent enough for this prototype and much faster.
+
+4. Hot-path method binding and bounded top-K selection remain.
+   - We bind scorer/store callables once in TimeIndex.
+   - We keep bounded selection with heap-based top-K.
+   - Reason: this materially improves throughput.
+
+What we changed to move back toward the paper
+---------------------------------------------
+1. Anchor scoring is now paper-style in structure.
+   - Implemented as:
+     0.30 * rarity
+     + 0.30 * impact
+     + 0.20 * coverage
+     + 0.10 * chain-head bonus
+     - 0.10 * redundancy
+   - Existing anchors are now consulted during anchor insertion.
+
+2. Skip scoring is now paper-style in structure.
+   - Implemented as:
+     0.25 * correlation
+     + 0.25 * impact
+     + 0.20 * novelty
+     + 0.20 * bridge
+     - 0.10 * cost
+   - Bridge is approximated as anchor value minus best ordinary predecessor value, clipped at zero.
+   - Cost is still a bounded proxy from object cost, not the exact budget-relative formula in the paper.
+
+3. Skip-link confidence is separated from skip value.
+   - skip_value now stores the paper-style long-range score.
+   - segment_confidence now stores a local confidence proxy:
+     - dependency score for event anchors
+     - dependency_confidence for chain summaries
+
+Paper text that should be updated
+---------------------------------
+1. Section 6.4.1 / Local Dependency Score
+   - The code is not pure entity-key Jaccard anymore.
+   - It includes a flow-continuity enhancement for transaction-like predecessor relations.
+
+2. Section 6.4.6 / Skip Score
+   - The implementation now follows the paper structure more closely.
+   - However, the cost term is still a practical proxy, not the exact budget-normalized formula.
+   - Bridge is approximated using retained ordinary predecessors and bounded available features.
+
+3. Section 6.6 / Construction Procedure
+   - The implementation does not literally "look up all keys in K_t".
+   - It uses a bounded optimized candidate lookup based mainly on entity/flow keys plus prefiltering.
+   - This should be documented explicitly as an optimization over the default prototype procedure.
+
+4. Section 6.3.4 / Chain family
+   - The implementation still prefers transaction_flow / account_sequence when flow structure is clear,
+     before falling back to aspect-based family selection.
+   - If the paper wants exact consistency, this should be stated as the prototype default.
+
+5. Section 6.3.6 / Skip link schema
+   - The implementation now distinguishes skip_value from segment_confidence.
+   - The paper can describe segment_confidence as a local confidence proxy rather than forcing it
+     to equal the long-range skip value.
+
+Current practical position
+--------------------------
+The codebase now uses a hybrid design:
+- efficient construction and ordinary-link logic from the optimized implementation
+- paper-style anchor and skip scoring where those definitions matter most
+
+This is the version we currently consider both efficient and reasonable.
+
+
+Adaptive LLM budget note
+------------------------
+Problem
+-------
+In the IBM AML end-to-end runs, a fixed downstream LLM evidence budget was too blunt.
+Some query events had rich retrieved context under budget 8, while others returned only
+0--3 prior events or only one generic aspect. For those thin-history cases, the agent
+often defaulted to a negative decision even when the query itself was laundering-labeled.
+
+Implementation change
+---------------------
+The SQLite-backed DeepSeek sample runner now supports a deterministic adaptive budget policy.
+
+Procedure:
+1. Run retrieval with base budget B.
+2. Inspect the retrieved evidence payload before calling the LLM.
+3. If either of the following holds:
+   - retrieved event count < E_min
+   - retrieved aspect diversity < A_min
+   then rerun retrieval once with expanded budget B_max.
+4. Pass the expanded evidence set to the LLM only when the second retrieval is at least as rich
+   in event count as the original one.
+
+Current default thresholds in the evaluation runner:
+- base budget B = 8
+- expanded budget B_max = 16
+- minimum event count E_min = 4
+- minimum aspect diversity A_min = 2
+
+Why this change is reasonable
+-----------------------------
+1. It keeps easy cases cheap.
+   - Queries that already have enough evidence stay at the original budget.
+
+2. It spends more context only on thin-history cases.
+   - This is where end-to-end false negatives were concentrated in the random 100-positive sample.
+
+3. It is deterministic and bounded.
+   - At most one additional retrieval pass is allowed.
+   - The expanded budget is fixed in advance.
+
+Paper-facing interpretation
+---------------------------
+If discussed in the paper, this should be described as a practical downstream evidence-presentation heuristic,
+not as a change to the core TimeIndex retrieval objective.
+
+Suggested wording:
+
+\[
+\text{For downstream agent evaluation, we optionally apply a bounded adaptive presentation budget.}
+\]
+\[
+\text{Queries whose initial retrieved context is too sparse in event count or aspect diversity are allowed one}
+\]
+\[
+\text{larger retrieval pass before the evidence is passed to the language model.}
+\]
+
+This should be framed as an inference-time presentation policy:
+- not a modification of the online index construction
+- not a modification of the core retrieval score
+- but a bounded decision-support heuristic for thin-context cases
+
+
+Budgeted skip-link selection note
+---------------------------------
+Problem statement
+-----------------
+Under a retrieval budget, skip-link selection should not be described as a purely local ranking problem.
+Once the objective includes overlap, aspect coverage, entity novelty, and interaction with ordinary evidence,
+the selection problem becomes combinatorial.
+
+Let:
+- Q be the query event
+- C = {c_1, ..., c_m} be the candidate set of evidence objects, including ordinary objects and skip objects
+- b(c_i) > 0 be the budget cost of candidate c_i
+- B be the total retrieval budget
+- U(S ; Q) be the utility of selecting subset S \subseteq C for explaining query Q
+
+We may then define the ideal selection problem as:
+
+\[
+S^* = \arg\max_{S \subseteq C}
+\; U(S ; Q)
+\quad \text{s.t.} \quad
+\sum_{c \in S} b(c) \le B
+\]
+
+where U(\cdot ; Q) is not assumed to be additive, because:
+- two candidates may cover overlapping entities or aspects
+- a skip object may reduce the value of nearby ordinary objects
+- a skip object may only become valuable after some prerequisite coverage is already present
+
+Reduction intuition
+-------------------
+This optimization subsumes several standard hard problems.
+
+1. Knapsack reduction.
+   - If utility is additive, i.e.
+
+\[
+U(S ; Q) = \sum_{c \in S} v(c)
+\]
+
+   then the problem reduces directly to 0-1 knapsack.
+
+2. Budgeted maximum coverage reduction.
+   - Suppose each candidate c covers a subset M(c) of latent evidence atoms
+     (e.g. entities, aspects, historical support events, or causal motifs),
+     and utility is the cardinality of the union:
+
+\[
+U(S ; Q) = \left| \bigcup_{c \in S} M(c) \right|
+\]
+
+   with per-candidate costs b(c).
+   - Then the problem becomes budgeted maximum coverage, which is NP-hard.
+
+Therefore, the general budgeted skip-link selection problem is NP-hard in the worst case,
+provided the utility definition includes either additive value with costs or non-additive coverage structure.
+
+Paper-facing interpretation
+---------------------------
+The paper should avoid implying that skip-link selection is an exact globally optimized procedure.
+Instead, it is more accurate to describe the prototype as solving an approximate budgeted evidence selection problem.
+
+A suitable wording is:
+
+\[
+\text{Budgeted skip-link selection can be formulated as a constrained maximum-utility evidence retrieval problem,}
+\]
+\[
+\text{which subsumes knapsack and budgeted maximum coverage objectives and is therefore NP-hard in general.}
+\]
+
+Prototype consequence
+---------------------
+Because exact optimization is not practical online, the implementation should use bounded heuristic search.
+The intended retrieval policy is:
+
+1. Treat ordinary links and skip links as candidates in one shared frontier.
+2. Rank candidates by a marginal-utility-per-cost priority.
+3. Penalize overlap with already selected evidence.
+4. Enforce bounded branching, bounded frontier size, and bounded expansion count.
+5. Use skip links as compressed bridge objects rather than expanding all reachable graph branches.
+
+This means the practical algorithm is best described as:
+- budgeted best-first search
+- A*-inspired heuristic evidence search
+- or greedy submodular-style approximation, depending on presentation preference
+
+What should stay consistent
+---------------------------
+To keep the paper and code aligned, skip-link logic should satisfy:
+
+1. Construction time:
+   - store only a bounded set of high-value skip candidates per target/family
+   - estimate value using the same utility ingredients later used at retrieval time
+
+2. Retrieval time:
+   - skip links do not bypass the budget
+   - skip links compete directly with ordinary evidence objects
+   - skip links are selected only when their expected bridge value justifies their cost
+
+3. Explanation time:
+   - skip links should be interpreted as compressed long-range bridge evidence,
+     not as guaranteed causal ground-truth edges
+
+Recommended paper update
+------------------------
+If a complexity note is added, the paper can include a short proposition or discussion paragraph:
+
+\[
+\textbf{Proposition.}
+\]
+\[
+\text{The budgeted selection of skip-linked evidence objects for a query can be cast as a constrained}
+\]
+\[
+\text{maximum-utility subset selection problem. In the presence of per-object costs and non-additive}
+\]
+\[
+\text{coverage/novelty utility, this problem subsumes 0-1 knapsack and budgeted maximum coverage,}
+\]
+\[
+\text{and is therefore NP-hard in general.}
+\]
+
+Operationally, this justifies the use of approximate bounded heuristic search in the prototype.
+
+
+Late-positive benchmark sampling note
+------------------------------------
+Problem
+-------
+The original 100-positive / 100-negative DeepSeek sample used unrestricted reservoir sampling
+over the full 5M indexed slice. This created a measurement artifact:
+
+- many positive queries were sampled from early parts of the 5M slice
+- for those queries, relevant historical clues may lie before the start of the built index
+- this suppressed end-to-end positive performance for reasons unrelated to the downstream agent alone
+
+Observed evidence
+-----------------
+In the original unrestricted sample:
+- 41 / 100 positives were before insertion order 1,000,000
+- only 9 / 100 positives were at or beyond insertion order 4,000,000
+
+This is undesirable if the benchmark question is:
+\[
+\text{Given a built 5M index, how well can the system use the history that is actually inside that index?}
+\]
+
+Implementation change
+---------------------
+The DeepSeek sample runner now supports separate timeline cutoffs for positive and negative sampling:
+
+- `min_insertion_order`
+- `positive_min_insertion_order`
+- `negative_min_insertion_order`
+
+Default policy
+--------------
+The default DeepSeek benchmark sampler now uses:
+
+- positive sampler cutoff: insertion order >= 4,000,000
+- negative sampler cutoff: unrestricted
+
+Interpretation:
+- positives are forced into the late feasible region, where supporting evidence is much more likely
+  to lie inside the built 5M index
+- negatives remain sampled from the broader pool so the benchmark does not become artificially skewed
+  toward only the hardest late-tail negatives
+
+Why this is the preferred default
+---------------------------------
+We tested three sampling regimes:
+
+1. Unrestricted positives + unrestricted negatives
+   - positive predicted-positive rate: 0.58
+   - negative predicted-positive rate: 0.09
+
+2. Late positives + late negatives (>= 4,000,000)
+   - positive predicted-positive rate: 0.59
+   - negative predicted-positive rate: 0.24
+
+3. Late positives + unrestricted negatives
+   - positive predicted-positive rate: 0.62
+   - negative predicted-positive rate: 0.13
+
+Conclusion:
+- late-positive-only sampling improves fairness for the positive side
+- late-only-for-both-classes makes the negative pool much harder and changes the benchmark distribution too much
+- therefore, late positives + unrestricted negatives is the current default benchmark policy
+
+Paper-facing wording
+--------------------
+A suitable benchmark note is:
+
+\[
+\text{For end-to-end LLM evaluation on a truncated 5M index, positive query transactions are sampled from the}
+\]
+\[
+\text{late portion of the indexed stream so that supporting history is likely to exist inside the available}
+\]
+\[
+\text{index horizon. Negative queries remain sampled from the broader indexed pool.}
+\]
+
+This should be described as a benchmark-construction decision, not as a core retrieval algorithm change.
