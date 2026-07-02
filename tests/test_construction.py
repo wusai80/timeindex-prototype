@@ -285,6 +285,55 @@ def test_enable_skip_links_flag_disables_skip_insertion(monkeypatch) -> None:
     assert index.skip_links("q1") == []
 
 
+def test_trivial_single_event_skip_anchors_can_be_filtered(monkeypatch) -> None:
+    install_test_doubles(monkeypatch)
+    config = make_config()
+    config.construction.skip_min_single_event_order_gap = 10
+    index = TimeIndex(config)
+
+    for i in range(5):
+        index.insert(make_event(f"a{i}", i, f"A{i}", beneficiary_id="shared", anchor=True, aspects={"source_accumulation"}))
+
+    index.insert(make_event("base", 20, "shared", anchor=False, aspects={"routine"}))
+    index.insert(make_event("query", 21, "shared", beneficiary_id="B", anchor=False, aspects={"full_balance_transfer"}))
+
+    skip_links = index.skip_links("query")
+
+    assert skip_links
+    assert all(len(link.representative_event_ids) >= 2 for link in skip_links)
+
+
+def test_skip_funnel_report_tracks_stages(monkeypatch) -> None:
+    index = build_index(monkeypatch)
+    for i in range(3):
+        index.insert(make_event(f"a{i}", i, f"A{i}", beneficiary_id="shared", anchor=True, aspects={"source_accumulation"}))
+
+    index.insert(make_event("base", 20, "shared", anchor=False, aspects={"routine"}))
+    index.insert(make_event("query", 21, "shared", beneficiary_id="B", anchor=False, aspects={"full_balance_transfer"}))
+
+    report = index.skip_funnel_report()
+
+    assert report["events_processed"] >= 5
+    assert report["stages"]["raw_candidates"] >= report["stages"]["forward_validated_candidates"]
+    assert report["stages"].get("selected_links", 0) >= 0
+    assert "candidate_types" in report
+    assert "score_means" in report
+
+
+def test_chain_richness_report_tracks_created_and_anchored_chains(monkeypatch) -> None:
+    index = build_index(monkeypatch)
+    index.insert(make_event("p1", 1, "A", beneficiary_id="mid", anchor=True, aspects={"source_accumulation"}))
+    index.insert(make_event("p2", 2, "mid", beneficiary_id="B", anchor=True, aspects={"beneficiary_novelty"}))
+    index.insert(make_event("q", 3, "B", beneficiary_id="C", anchor=False, aspects={"large_transfer"}))
+
+    report = index.chain_richness_report()
+
+    assert report["created_chains"]["count"] >= 1
+    assert report["created_chains"]["mean_hop_count"] >= 1.0
+    assert report["created_chains"]["max_representative_event_count"] >= 1
+    assert report["anchored_chains"]["count"] >= 1
+
+
 def test_iso_time_strings_are_causal_in_construction(monkeypatch) -> None:
     install_test_doubles(monkeypatch)
     index = TimeIndex(make_config())
@@ -309,6 +358,33 @@ def test_iso_time_strings_are_causal_in_construction(monkeypatch) -> None:
     )
 
     assert index._is_causal_predecessor(early, late) is True
+
+
+def test_same_timestamp_is_not_causal_predecessor(monkeypatch) -> None:
+    install_test_doubles(monkeypatch)
+    index = TimeIndex(make_config())
+    shared_time = fake_featurize_event(
+        Event(event_id="e1", time=5, event_type="transaction", attrs={"account_id": "A"}),
+        None,
+    )
+    same_time = fake_featurize_event(
+        Event(event_id="e2", time=5, event_type="transaction", attrs={"account_id": "A"}),
+        None,
+    )
+
+    assert index._is_causal_predecessor(shared_time, same_time) is False
+
+
+def test_enable_bridge_score_gates_chain_anchor_registration(monkeypatch) -> None:
+    config = make_config()
+    config.construction.enable_bridge_score = False
+    install_test_doubles(monkeypatch)
+    index = TimeIndex(config)
+    index.insert(make_event("p1", 1, "A", beneficiary_id="B", anchor=True, aspects={"source_accumulation"}))
+    index.insert(make_event("q", 2, "B", beneficiary_id="C", aspects={"large_transfer"}))
+
+    assert index.chain_richness_report()["created_chains"]["count"] >= 1
+    assert index.chain_richness_report()["anchored_chains"]["count"] == 0
 
 
 def test_chain_candidate_with_missing_supporting_events_is_not_causal(monkeypatch) -> None:
@@ -412,6 +488,59 @@ def test_forward_validation_uses_chain_supporting_event(monkeypatch) -> None:
     assert index._forward_validates_skip_candidate(chain, target_record, []) is True
 
 
+def test_skip_links_keep_distinct_chain_anchor_ids(monkeypatch) -> None:
+    index = build_index(monkeypatch)
+
+    root1 = fake_featurize_event(
+        Event("r1", 1, "transaction", attrs={"account_id": "A", "beneficiary_id": "B", "aspects": {"source_accumulation"}}),
+        None,
+    )
+    root2 = fake_featurize_event(
+        Event("r2", 2, "transaction", attrs={"account_id": "A", "beneficiary_id": "B", "aspects": {"source_accumulation"}}),
+        None,
+    )
+    tail = fake_featurize_event(
+        Event("tail", 3, "transaction", attrs={"account_id": "B", "beneficiary_id": "C", "aspects": {"large_transfer"}}),
+        None,
+    )
+    target = fake_featurize_event(
+        Event("q", 4, "transaction", attrs={"account_id": "C", "beneficiary_id": "D", "aspects": {"large_transfer"}}),
+        None,
+    )
+    for record in (root1, root2, tail, target):
+        index.event_store.insert(record)
+
+    chain1 = ChainSummary(
+        chain_id="chain:r1:tail",
+        family="transaction_flow",
+        head_id="r1",
+        tail_id="tail",
+        representative_event_ids=["r1", "tail"],
+        source_entities={"a"},
+        destination_entities={"c"},
+        aspects={"large_transfer"},
+        dependency_confidence=0.9,
+        summary="branch 1",
+    )
+    chain2 = ChainSummary(
+        chain_id="chain:r2:tail",
+        family="transaction_flow",
+        head_id="r2",
+        tail_id="tail",
+        representative_event_ids=["r2", "tail"],
+        source_entities={"a"},
+        destination_entities={"c"},
+        aspects={"large_transfer"},
+        dependency_confidence=0.85,
+        summary="branch 2",
+    )
+
+    skip_links = index._select_skip_links(target, [chain1, chain2], ordinary_links=[])
+
+    assert len(skip_links) == 2
+    assert {link.from_id for link in skip_links} == {"chain:r1:tail", "chain:r2:tail"}
+
+
 def test_synthetic_transaction_sequence_creates_ordinary_and_skip_links(monkeypatch) -> None:
     index = build_index(monkeypatch)
     events = [
@@ -433,7 +562,7 @@ def test_synthetic_transaction_sequence_creates_ordinary_and_skip_links(monkeypa
     assert ordinary
     assert skip
     assert any(link.predecessor_id == "e6" for link in ordinary)
-    assert any(link.from_id in {"e1", "e2", "e3", "e5"} for link in skip)
+    assert any(set(link.representative_event_ids) & {"e1", "e2", "e3", "e5"} for link in skip)
 
 
 def test_real_index_links_across_interacting_accounts() -> None:
@@ -662,6 +791,65 @@ def test_real_local_candidates_keep_latest_fallback_after_prefilter() -> None:
     candidates = index._local_candidate_records(record)
 
     assert [candidate.event.event_id for candidate in candidates] == ["new"]
+
+
+def test_real_lanl_computer_handoff_links_predecessor() -> None:
+    config = TimeIndexConfig()
+    config.stores.ordinary_fan_in = 3
+    config.stores.skip_fan_in = 0
+    config.stores.active_history_size = 100
+    config.scoring.local_dependency_threshold = 0.30
+    config.scoring.time_decay = 1_000_000.0
+
+    index = TimeIndex(config)
+    history = [
+        Event(
+            event_id="e1",
+            time=1,
+            event_type="authentication",
+            attrs={
+                "src_user": "alice",
+                "dst_user": "bob",
+                "src_computer": "c1",
+                "dst_computer": "c2",
+                "auth_type": "Kerberos",
+                "is_cross_host_auth": True,
+            },
+        ),
+        Event(
+            event_id="e2",
+            time=2,
+            event_type="authentication",
+            attrs={
+                "src_user": "alice",
+                "dst_user": "bob",
+                "src_computer": "c2",
+                "dst_computer": "c3",
+                "auth_type": "Kerberos",
+                "is_cross_host_auth": True,
+            },
+        ),
+        Event(
+            event_id="q",
+            time=3,
+            event_type="authentication",
+            attrs={
+                "src_user": "alice",
+                "dst_user": "admin",
+                "src_computer": "c3",
+                "dst_computer": "c4",
+                "auth_type": "Kerberos",
+                "is_cross_host_auth": True,
+                "is_new_dst_for_user": True,
+            },
+        ),
+    ]
+
+    for event in history:
+        index.insert(event)
+
+    incoming = index.ordinary_links("q")
+    assert any(link.predecessor_id == "e2" for link in incoming)
 
 
 def test_real_ordinary_link_tie_break_prefers_more_recent_candidate() -> None:

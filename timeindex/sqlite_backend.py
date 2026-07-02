@@ -166,6 +166,28 @@ class SqliteTimeIndexWriter:
             [_skip_row(link) for link in skip_links],
         )
 
+    def expire_event_ids(self, event_ids: Sequence[str]) -> None:
+        expired_ids = [str(event_id) for event_id in event_ids if str(event_id)]
+        if not expired_ids:
+            return
+        placeholders = ", ".join("?" for _ in expired_ids)
+        self.connection.execute(
+            f"UPDATE events SET expired = 1 WHERE event_id IN ({placeholders})",
+            expired_ids,
+        )
+        self.connection.execute(
+            f"DELETE FROM ordinary_links WHERE successor_id IN ({placeholders}) OR predecessor_id IN ({placeholders})",
+            [*expired_ids, *expired_ids],
+        )
+        self.connection.execute(
+            f"DELETE FROM chain_summaries WHERE tail_id IN ({placeholders}) OR head_id IN ({placeholders})",
+            [*expired_ids, *expired_ids],
+        )
+        self.connection.execute(
+            f"DELETE FROM skip_links WHERE to_id IN ({placeholders}) OR from_id IN ({placeholders})",
+            [*expired_ids, *expired_ids],
+        )
+
     def flush(self) -> None:
         self.connection.commit()
         self.connection.execute("BEGIN")
@@ -760,6 +782,8 @@ def _skip_row(link: SkipLink) -> tuple[Any, ...]:
         _encode_json(list(link.representative_event_ids)),
         float(link.cost),
     )
+
+
 
 
 def _config_from_dict(payload: dict[str, Any]) -> TimeIndexConfig:

@@ -148,6 +148,9 @@ class ChainSummary:
     destination_entities: set[str] = field(default_factory=set)
     aspects: set[str] = field(default_factory=set)
     dependency_confidence: float = 0.0
+    hop_count: int = 0
+    order_span: int = 0
+    temporal_span_seconds: float = 0.0
     summary: str = ""
     cost: float = 0.0
 
@@ -179,6 +182,10 @@ _SOURCE_ENTITY_FIELDS = {
     "sender_account",
     "src_user",
     "source_user",
+    "src_computer",
+    "source_computer",
+    "from_computer",
+    "origin_computer",
 }
 _DESTINATION_ENTITY_FIELDS = {
     "dst_account",
@@ -192,6 +199,10 @@ _DESTINATION_ENTITY_FIELDS = {
     "target_account",
     "dst_user",
     "target_user",
+    "dst_computer",
+    "destination_computer",
+    "target_computer",
+    "to_computer",
 }
 
 

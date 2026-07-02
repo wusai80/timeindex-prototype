@@ -15,6 +15,7 @@ from timeindex.scoring import (
     rarity_score,
     retrieval_marginal_utility,
     skip_score,
+    skip_score_breakdown,
 )
 
 
@@ -438,6 +439,190 @@ def test_skip_score_rewards_anchor_that_bridges_into_query_source() -> None:
     weak_score = skip_score(weak_anchor, target, intent, ordinary_predecessors=[local_predecessor], config=config)
 
     assert bridged_score > weak_score
+
+
+def test_skip_score_breakdown_matches_skip_score() -> None:
+    config = ScoringConfig(time_decay=10.0)
+    intent = DecisionIntent(aspects={"source_accumulation", "full_balance_transfer"})
+    target = _record(
+        "target",
+        10.0,
+        keys={"entity:src_account=a", "entity:dst_account=b", "flow_pair:a->b"},
+        aspects={"full_balance_transfer"},
+        vector=[1.0, 0.0, 1.0],
+        attrs={"src_account": "A", "dst_account": "B"},
+    )
+    anchor = _record(
+        "anchor",
+        4.0,
+        keys={"entity:src_account=x", "entity:dst_account=a", "flow_pair:x->a"},
+        aspects={"source_accumulation"},
+        vector=[1.0, 0.0, 1.0],
+        attrs={"src_account": "X", "dst_account": "A"},
+        rarity=0.5,
+    )
+    local_predecessor = _record(
+        "pred",
+        9.0,
+        keys={"entity:src_account=a", "entity:dst_account=b", "flow_pair:a->b"},
+        aspects={"generic_evidence"},
+        vector=[1.0, 0.0, 1.0],
+        attrs={"src_account": "A", "dst_account": "B"},
+    )
+
+    breakdown = skip_score_breakdown(anchor, target, intent, ordinary_predecessors=[local_predecessor], config=config)
+
+    assert {
+        "corr",
+        "impact",
+        "novelty",
+        "anchor_value",
+        "best_ordinary_value",
+        "bridge",
+        "participant_bridge",
+        "cost",
+        "generic_penalty",
+        "score",
+    } <= set(breakdown)
+    assert breakdown["score"] == skip_score(anchor, target, intent, ordinary_predecessors=[local_predecessor], config=config)
+
+
+def test_skip_score_penalizes_lanl_fanout_without_destination_bridge() -> None:
+    config = ScoringConfig(time_decay=100.0, skip_lanl_temporal_gain_scale=400.0)
+    intent = DecisionIntent(aspects={"lateral_movement", "credential_reuse"})
+    target = _record(
+        "target",
+        1000.0,
+        keys={"entity:user:u1", "type:authentication"},
+        aspects={"lateral_movement"},
+        vector=[1.0, 0.0, 0.0],
+        attrs={
+            "src_user": "u1",
+            "src_computer": "c17693",
+            "dst_computer": "c9000",
+            "auth_type": "NTLM",
+            "is_new_dst_for_user": True,
+            "prior_user_event_count": 80,
+            "prior_user_host_count": 16,
+        },
+    )
+    fanout_anchor = _record(
+        "fanout",
+        997.0,
+        keys={"entity:user:u1", "type:authentication"},
+        aspects={"credential_reuse"},
+        vector=[1.0, 0.0, 0.0],
+        attrs={
+            "src_user": "u1",
+            "src_computer": "c17693",
+            "dst_computer": "c500",
+            "auth_type": "NTLM",
+        },
+    )
+    destination_bridge_anchor = _record(
+        "bridge",
+        995.0,
+        keys={"entity:user:u1", "type:authentication"},
+        aspects={"lateral_movement"},
+        vector=[1.0, 0.0, 0.0],
+        attrs={
+            "src_user": "u1",
+            "src_computer": "c9000",
+            "dst_computer": "c9000",
+            "auth_type": "NTLM",
+        },
+    )
+    ordinary_predecessors = [
+        _record(
+            "pred1",
+            999.0,
+            keys={"entity:user:u1", "type:authentication"},
+            aspects={"credential_reuse"},
+            vector=[1.0, 0.0, 0.0],
+            attrs={"src_user": "u1", "src_computer": "c17693", "dst_computer": "c501", "auth_type": "NTLM"},
+        ),
+        _record(
+            "pred2",
+            998.0,
+            keys={"entity:user:u1", "type:authentication"},
+            aspects={"credential_reuse"},
+            vector=[1.0, 0.0, 0.0],
+            attrs={"src_user": "u1", "src_computer": "c17693", "dst_computer": "c502", "auth_type": "NTLM"},
+        ),
+    ]
+
+    fanout_breakdown = skip_score_breakdown(fanout_anchor, target, intent, ordinary_predecessors, config)
+    bridge_breakdown = skip_score_breakdown(destination_bridge_anchor, target, intent, ordinary_predecessors, config)
+
+    assert fanout_breakdown["lanl_fanout_penalty"] > 0.0
+    assert bridge_breakdown["lanl_bridge_bonus"] > 0.0
+    assert skip_score(destination_bridge_anchor, target, intent, ordinary_predecessors, config) > skip_score(
+        fanout_anchor,
+        target,
+        intent,
+        ordinary_predecessors,
+        config,
+    )
+
+
+def test_skip_score_rewards_lanl_temporal_bridge_gain_and_bootstrap_recovery() -> None:
+    config = ScoringConfig(time_decay=100.0, skip_lanl_temporal_gain_scale=200.0)
+    intent = DecisionIntent(aspects={"lateral_movement"})
+    target = _record(
+        "target",
+        500.0,
+        keys={"entity:user:u2", "type:authentication"},
+        aspects={"lateral_movement"},
+        vector=[1.0, 0.0, 0.0],
+        attrs={
+            "src_user": "u2",
+            "src_computer": "c17693",
+            "dst_computer": "c801",
+            "auth_type": "NTLM",
+            "is_new_dst_for_user": True,
+            "prior_user_event_count": 0,
+            "prior_user_host_count": 0,
+        },
+    )
+    bootstrap_anchor = _record(
+        "bootstrap",
+        420.0,
+        keys={"entity:user:u2", "type:authentication"},
+        aspects={"lateral_movement"},
+        vector=[1.0, 0.0, 0.0],
+        attrs={
+            "src_user": "u2",
+            "src_computer": "c17693",
+            "dst_computer": "c2731",
+            "auth_type": "NTLM",
+        },
+    )
+    recent_nonbridge = _record(
+        "recent",
+        495.0,
+        keys={"entity:user:u3", "type:authentication"},
+        aspects={"generic_evidence"},
+        vector=[1.0, 0.0, 0.0],
+        attrs={
+            "src_user": "u3",
+            "src_computer": "c400",
+            "dst_computer": "c401",
+            "auth_type": "NTLM",
+        },
+    )
+
+    bootstrap_breakdown = skip_score_breakdown(bootstrap_anchor, target, intent, ordinary_predecessors=[], config=config)
+    recent_breakdown = skip_score_breakdown(recent_nonbridge, target, intent, ordinary_predecessors=[], config=config)
+
+    assert bootstrap_breakdown["lanl_temporal_gain"] > 0.0
+    assert bootstrap_breakdown["lanl_bridge_bonus"] > 0.0
+    assert skip_score(bootstrap_anchor, target, intent, ordinary_predecessors=[], config=config) > skip_score(
+        recent_nonbridge,
+        target,
+        intent,
+        ordinary_predecessors=[],
+        config=config,
+    )
 
 
 def test_retrieval_marginal_utility_and_priority_are_bounded_and_cost_aware() -> None:

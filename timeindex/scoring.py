@@ -88,6 +88,156 @@ def _object_flow_entities(
     return set(), set()
 
 
+def _record_attrs(obj: EventRecord | ChainSummary | EvidenceObject | SkipLink) -> dict[str, Any]:
+    if isinstance(obj, EventRecord):
+        return dict(obj.event.attrs)
+    return {}
+
+
+def _object_time_value(obj: EventRecord | ChainSummary | EvidenceObject | SkipLink) -> float | None:
+    if isinstance(obj, EventRecord):
+        return _event_time(obj)
+    return None
+
+
+def _is_tgt_host(value: Any) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized in {"tgt", "krbtgt"}
+
+
+def _is_machine_like_user(value: Any) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized.endswith("$")
+
+
+def _is_lanl_like(record: EventRecord) -> bool:
+    attrs = record.event.attrs
+    return "src_computer" in attrs or "dst_computer" in attrs
+
+
+def _lanl_real_host(value: Any, *, src_host: Any = "") -> bool:
+    host = str(value or "").strip()
+    src = str(src_host or "").strip()
+    if not host:
+        return False
+    if _is_tgt_host(host):
+        return False
+    return host != src
+
+
+def _lanl_skip_adjustment(
+    anchor: EventRecord | ChainSummary | EvidenceObject | SkipLink,
+    target: EventRecord,
+    ordinary_predecessors: Sequence[EventRecord | ChainSummary | EvidenceObject | SkipLink],
+    config: ScoringConfig,
+) -> dict[str, float]:
+    if not _is_lanl_like(target):
+        return {
+            "bridge_bonus": 0.0,
+            "fanout_penalty": 0.0,
+            "temporal_gain": 0.0,
+            "ordinary_real_fanout": 0.0,
+        }
+
+    target_attrs = dict(target.event.attrs)
+    target_user = str(target_attrs.get("src_user") or "")
+    target_src_host = str(target_attrs.get("src_computer") or "")
+    target_dst_host = str(target_attrs.get("dst_computer") or "")
+    target_time = _event_time(target)
+    high_baseline = (
+        int(target_attrs.get("prior_user_event_count", 0) or 0) >= int(config.skip_lanl_high_baseline_events)
+        or int(target_attrs.get("prior_user_host_count", 0) or 0) >= int(config.skip_lanl_high_baseline_hosts)
+    )
+
+    anchor_attrs = _record_attrs(anchor)
+    anchor_user = str(anchor_attrs.get("src_user") or "")
+    anchor_src_host = str(anchor_attrs.get("src_computer") or "")
+    anchor_dst_host = str(anchor_attrs.get("dst_computer") or "")
+    same_user = bool(target_user and anchor_user == target_user)
+    same_src_host = bool(target_src_host and anchor_src_host == target_src_host)
+    touches_query_dst = bool(
+        target_dst_host and (anchor_dst_host == target_dst_host or anchor_src_host == target_dst_host)
+    )
+    local_on_query_dst = bool(
+        target_dst_host and anchor_src_host == target_dst_host and anchor_dst_host == target_dst_host
+    )
+    anchor_real_other_host = bool(
+        same_user
+        and same_src_host
+        and _lanl_real_host(anchor_dst_host, src_host=anchor_src_host)
+        and anchor_dst_host != target_dst_host
+    )
+    target_real_host = _lanl_real_host(target_dst_host, src_host=target_src_host)
+
+    ordinary_real_hosts: set[str] = set()
+    ordinary_times: list[float] = []
+    for predecessor in ordinary_predecessors:
+        pred_attrs = _record_attrs(predecessor)
+        pred_user = str(pred_attrs.get("src_user") or "")
+        pred_src_host = str(pred_attrs.get("src_computer") or "")
+        pred_dst_host = str(pred_attrs.get("dst_computer") or "")
+        if (
+            pred_user == target_user
+            and pred_src_host == target_src_host
+            and _lanl_real_host(pred_dst_host, src_host=pred_src_host)
+        ):
+            ordinary_real_hosts.add(pred_dst_host)
+        pred_time = _object_time_value(predecessor)
+        if pred_time is not None:
+            ordinary_times.append(pred_time)
+
+    temporal_gain = 0.0
+    if target_time is not None:
+        anchor_time = _object_time_value(anchor)
+        if anchor_time is not None and anchor_time < target_time:
+            anchor_gap = target_time - anchor_time
+            ordinary_gap = 0.0
+            if ordinary_times:
+                ordinary_gap = max(target_time - candidate_time for candidate_time in ordinary_times if candidate_time < target_time)
+            gain = max(0.0, anchor_gap - ordinary_gap)
+            temporal_gain = _clip01(gain / max(float(config.skip_lanl_temporal_gain_scale), 1e-8))
+
+    bridge_bonus = 0.0
+    if local_on_query_dst:
+        bridge_bonus = max(bridge_bonus, 1.0)
+    elif touches_query_dst:
+        bridge_bonus = max(bridge_bonus, 0.85)
+    elif same_user and same_src_host and temporal_gain >= 0.50 and target_real_host:
+        bridge_bonus = max(bridge_bonus, 0.70)
+    elif not ordinary_predecessors and same_user and same_src_host and temporal_gain >= 0.20:
+        bridge_bonus = max(bridge_bonus, 0.55)
+    if (
+        same_user
+        and same_src_host
+        and target_real_host
+        and len(ordinary_real_hosts) >= 2
+        and temporal_gain >= 0.15
+    ):
+        bridge_bonus = max(bridge_bonus, 0.65)
+
+    fanout_penalty = 0.0
+    if _is_tgt_host(target_dst_host) and not touches_query_dst:
+        fanout_penalty = max(fanout_penalty, 0.55)
+    if _is_machine_like_user(target_user) and not touches_query_dst:
+        fanout_penalty = max(fanout_penalty, 0.45)
+    if (
+        len(ordinary_real_hosts) >= 2
+        and anchor_real_other_host
+        and not touches_query_dst
+        and temporal_gain < 0.25
+    ):
+        fanout_penalty = max(fanout_penalty, 0.80)
+    if high_baseline and same_user and same_src_host and not touches_query_dst and temporal_gain < 0.15:
+        fanout_penalty = max(fanout_penalty, 0.60)
+
+    return {
+        "bridge_bonus": _clip01(bridge_bonus),
+        "fanout_penalty": _clip01(fanout_penalty),
+        "temporal_gain": _clip01(temporal_gain),
+        "ordinary_real_fanout": float(len(ordinary_real_hosts)),
+    }
+
+
 def _generic_anchor_penalty(anchor: EventRecord | ChainSummary | EvidenceObject | SkipLink) -> float:
     aspects = _object_aspects(anchor)
     if not aspects:
@@ -370,14 +520,14 @@ def anchor_score(
     return _clip01(score)
 
 
-def skip_score(
+def skip_score_breakdown(
     anchor: EventRecord | ChainSummary | EvidenceObject | SkipLink,
     target: EventRecord,
     intent: DecisionIntent,
     ordinary_predecessors: Sequence[EventRecord | ChainSummary | EvidenceObject | SkipLink],
     config: ScoringConfig,
-) -> float:
-    """Score a long-range skip link candidate against a target event."""
+) -> dict[str, float]:
+    """Return skip-score components and the final normalized score."""
 
     corr = _paper_correlation(anchor, target)
     impact = impact_score(anchor, intent)
@@ -392,8 +542,12 @@ def skip_score(
     participant_bridge = _participant_bridge_score(anchor, target, ordinary_predecessors)
     cost = _clip01(_object_cost(anchor))
     generic_penalty = _generic_anchor_penalty(anchor)
+    lanl_adjustment = _lanl_skip_adjustment(anchor, target, ordinary_predecessors, config)
+    lanl_bridge_bonus = float(lanl_adjustment["bridge_bonus"])
+    lanl_fanout_penalty = float(lanl_adjustment["fanout_penalty"])
+    lanl_temporal_gain = float(lanl_adjustment["temporal_gain"])
 
-    score = (
+    base_score = _clip01(
         0.20 * corr
         + 0.20 * impact
         + 0.15 * novelty
@@ -402,7 +556,36 @@ def skip_score(
         - 0.10 * cost
         - generic_penalty
     )
-    return _clip01(score)
+    score = _clip01(base_score + 0.15 * lanl_bridge_bonus + 0.05 * lanl_temporal_gain - 0.15 * lanl_fanout_penalty)
+    return {
+        "corr": corr,
+        "impact": impact,
+        "novelty": novelty,
+        "anchor_value": anchor_value,
+        "best_ordinary_value": best_ordinary_value,
+        "bridge": bridge,
+        "participant_bridge": participant_bridge,
+        "cost": cost,
+        "generic_penalty": generic_penalty,
+        "lanl_bridge_bonus": lanl_bridge_bonus,
+        "lanl_temporal_gain": lanl_temporal_gain,
+        "lanl_fanout_penalty": lanl_fanout_penalty,
+        "lanl_ordinary_real_fanout": float(lanl_adjustment["ordinary_real_fanout"]),
+        "base_score": base_score,
+        "score": score,
+    }
+
+
+def skip_score(
+    anchor: EventRecord | ChainSummary | EvidenceObject | SkipLink,
+    target: EventRecord,
+    intent: DecisionIntent,
+    ordinary_predecessors: Sequence[EventRecord | ChainSummary | EvidenceObject | SkipLink],
+    config: ScoringConfig,
+) -> float:
+    """Score a long-range skip link candidate against a target event."""
+
+    return skip_score_breakdown(anchor, target, intent, ordinary_predecessors, config)["score"]
 
 
 def retrieval_marginal_utility(

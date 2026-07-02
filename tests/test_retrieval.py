@@ -59,6 +59,33 @@ def _record(event_id: str, time: int, aspects: set[str]) -> EventRecord:
     )
 
 
+def _lanl_record(
+    event_id: str,
+    time: int,
+    *,
+    src_user: str,
+    src_host: str,
+    dst_host: str,
+    aspects: set[str],
+    auth_type: str = "NTLM",
+) -> EventRecord:
+    return EventRecord(
+        event=Event(
+            event_id=event_id,
+            time=time,
+            event_type="auth",
+            attrs={
+                "src_user": src_user,
+                "src_computer": src_host,
+                "dst_computer": dst_host,
+                "auth_type": auth_type,
+            },
+        ),
+        aspects=set(aspects),
+        metadata=EventMetadata(insertion_order=time),
+    )
+
+
 def _build_index() -> FakeIndex:
     records = {
         "e1": _record("e1", 1, {"source_accumulation"}),
@@ -188,6 +215,100 @@ def test_retrieval_returns_skip_evidence() -> None:
     assert skip_results[0].event_ids[0] == "e1"
 
 
+def test_retrieval_can_discover_skip_from_expanded_ordinary_predecessor() -> None:
+    records = {
+        "s1": _record("s1", 1, {"source_accumulation"}),
+        "p1": _record("p1", 2, {"beneficiary_novelty"}),
+        "q1": _record("q1", 3, {"full_balance_transfer"}),
+    }
+    edge_store = FakeEdgeStore(
+        {
+            "q1": [OrdinaryLink(predecessor_id="p1", successor_id="q1", score=0.95)],
+        }
+    )
+    chain_store = FakeChainStore({})
+    skip_link_store = FakeSkipLinkStore(
+        {
+            "p1": [
+                SkipLink(
+                    from_id="s1",
+                    to_id="p1",
+                    skip_value=0.9,
+                    aspects={"source_accumulation", "full_balance_transfer"},
+                    summary="Earlier buildup attached to the predecessor",
+                    representative_event_ids=["s1", "p1"],
+                    cost=1.0,
+                )
+            ]
+        }
+    )
+    index = FakeIndex(
+        event_store=FakeEventStore(records),
+        edge_store=edge_store,
+        chain_store=chain_store,
+        skip_link_store=skip_link_store,
+        config=TimeIndexConfig(
+            retrieval=RetrievalConfig(return_summaries=True, allow_skip_expansion=True, default_budget=3),
+            synthetic=None,  # type: ignore[arg-type]
+        ),
+    )
+    index.config.scoring = ScoringConfig(retrieval_stop_threshold=0.01)
+    intent = DecisionIntent(aspects={"source_accumulation", "full_balance_transfer"})
+
+    results = retrieve(index, "q1", intent, budget=2)
+
+    skip_results = [result for result in results if result.object_id.startswith("skip:")]
+    assert skip_results
+    assert skip_results[0].summary == "Earlier buildup attached to the predecessor"
+    assert "s1" in skip_results[0].event_ids
+
+
+def test_retrieval_demotes_generic_redundant_skip_candidates() -> None:
+    records = {
+        "s1": _record("s1", 1, {"generic_evidence"}),
+        "p1": _record("p1", 2, {"large_transfer"}),
+        "q1": _record("q1", 3, {"large_transfer"}),
+    }
+    edge_store = FakeEdgeStore(
+        {
+            "q1": [OrdinaryLink(predecessor_id="p1", successor_id="q1", score=0.95)],
+        }
+    )
+    chain_store = FakeChainStore({})
+    skip_link_store = FakeSkipLinkStore(
+        {
+            "p1": [
+                SkipLink(
+                    from_id="s1",
+                    to_id="p1",
+                    skip_value=0.9,
+                    aspects={"generic_evidence", "large_transfer"},
+                    summary="Generic redundant skip",
+                    representative_event_ids=["s1", "p1"],
+                    cost=1.25,
+                )
+            ]
+        }
+    )
+    index = FakeIndex(
+        event_store=FakeEventStore(records),
+        edge_store=edge_store,
+        chain_store=chain_store,
+        skip_link_store=skip_link_store,
+        config=TimeIndexConfig(
+            retrieval=RetrievalConfig(return_summaries=True, allow_skip_expansion=True, default_budget=1),
+            synthetic=None,  # type: ignore[arg-type]
+        ),
+    )
+    index.config.scoring = ScoringConfig(retrieval_stop_threshold=0.01)
+    intent = DecisionIntent(aspects={"large_transfer"})
+
+    results = retrieve(index, "q1", intent, budget=1)
+
+    assert results
+    assert all(not result.object_id.startswith("skip:") for result in results)
+
+
 def test_dual_frontier_beats_chain_only_local_myopia() -> None:
     index = _build_index()
     intent = DecisionIntent(aspects={"source_accumulation", "full_balance_transfer"})
@@ -264,3 +385,96 @@ def test_retrieval_excludes_query_event_and_future_events() -> None:
     assert "q" not in retrieved_ids
     assert "future" not in retrieved_ids
     assert "past" in retrieved_ids
+
+
+def test_lanl_retrieval_enriches_fanout_objects_with_specific_aspects() -> None:
+    records = {
+        "p1": _lanl_record("p1", 1, src_user="u1", src_host="c1", dst_host="c2", aspects={"credential_reuse"}),
+        "p2": _lanl_record("p2", 2, src_user="u1", src_host="c1", dst_host="c3", aspects={"credential_reuse"}),
+        "q": _lanl_record("q", 3, src_user="u1", src_host="c1", dst_host="c4", aspects={"new_host_access"}),
+    }
+    edge_store = FakeEdgeStore(
+        {
+            "q": [OrdinaryLink(predecessor_id="p2", successor_id="q", score=0.95)],
+            "p2": [OrdinaryLink(predecessor_id="p1", successor_id="p2", score=0.90)],
+        }
+    )
+    chain_store = FakeChainStore(
+        {
+            "q": [
+                ChainSummary(
+                    chain_id="chain:p1:q",
+                    family="auth",
+                    head_id="p2",
+                    tail_id="q",
+                    representative_event_ids=["p2", "p1"],
+                    aspects={"credential_reuse"},
+                    summary="Prior LANL auth chain",
+                    cost=1.0,
+                )
+            ]
+        }
+    )
+    skip_link_store = FakeSkipLinkStore({})
+    index = FakeIndex(
+        event_store=FakeEventStore(records),
+        edge_store=edge_store,
+        chain_store=chain_store,
+        skip_link_store=skip_link_store,
+        config=TimeIndexConfig(
+            retrieval=RetrievalConfig(return_summaries=True, allow_skip_expansion=True, default_budget=3),
+            synthetic=None,  # type: ignore[arg-type]
+        ),
+    )
+    index.config.scoring = ScoringConfig(retrieval_stop_threshold=0.01)
+
+    results = retrieve(index, "q", DecisionIntent(aspects={"credential_reuse"}), budget=3)
+
+    assert results
+    assert any("lanl_source_host_fanout" in result.aspects for result in results)
+    fanout_result = next(result for result in results if "lanl_source_host_fanout" in result.aspects)
+    assert "pattern=lanl_source_host_fanout" in fanout_result.summary
+    assert "query_host_touch=true" in fanout_result.summary
+
+
+def test_lanl_skip_summary_marks_detached_history() -> None:
+    records = {
+        "s1": _lanl_record("s1", 1, src_user="u9", src_host="c9", dst_host="c10", aspects={"credential_reuse"}),
+        "q": _lanl_record("q", 4, src_user="u1", src_host="c1", dst_host="c4", aspects={"new_host_access"}),
+    }
+    edge_store = FakeEdgeStore({})
+    chain_store = FakeChainStore({})
+    skip_link_store = FakeSkipLinkStore(
+        {
+            "q": [
+                SkipLink(
+                    from_id="s1",
+                    to_id="q",
+                    skip_value=0.9,
+                    aspects={"credential_reuse"},
+                    summary="Detached skip candidate",
+                    representative_event_ids=["s1"],
+                    cost=1.0,
+                )
+            ]
+        }
+    )
+    index = FakeIndex(
+        event_store=FakeEventStore(records),
+        edge_store=edge_store,
+        chain_store=chain_store,
+        skip_link_store=skip_link_store,
+        config=TimeIndexConfig(
+            retrieval=RetrievalConfig(return_summaries=True, allow_skip_expansion=True, default_budget=2),
+            synthetic=None,  # type: ignore[arg-type]
+        ),
+    )
+    index.config.scoring = ScoringConfig(retrieval_stop_threshold=0.01)
+
+    results = retrieve(index, "q", DecisionIntent(aspects={"credential_reuse"}), budget=2)
+
+    assert results
+    skip_results = [result for result in results if result.object_id.startswith("skip:")]
+    assert skip_results
+    assert "lanl_detached_history" in skip_results[0].aspects
+    assert "detached_from_query=true" in skip_results[0].summary

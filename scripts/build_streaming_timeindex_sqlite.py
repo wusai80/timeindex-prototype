@@ -37,6 +37,26 @@ def parse_args() -> argparse.Namespace:
         help="Progress JSON path.",
     )
     parser.add_argument(
+        "--skip-funnel-path",
+        default="",
+        help="Optional JSON path for skip funnel instrumentation output.",
+    )
+    parser.add_argument(
+        "--skip-funnel-markdown-path",
+        default="",
+        help="Optional Markdown path for a human-readable skip funnel report.",
+    )
+    parser.add_argument(
+        "--chain-richness-path",
+        default="",
+        help="Optional JSON path for chain-summary richness instrumentation output.",
+    )
+    parser.add_argument(
+        "--chain-richness-markdown-path",
+        default="",
+        help="Optional Markdown path for a human-readable chain-summary richness report.",
+    )
+    parser.add_argument(
         "--max-events",
         type=int,
         default=0,
@@ -76,6 +96,24 @@ def main() -> None:
     sqlite_path = Path(args.sqlite_path)
     progress_path = Path(args.progress_path)
     progress_path.parent.mkdir(parents=True, exist_ok=True)
+    skip_funnel_path = Path(args.skip_funnel_path) if args.skip_funnel_path else progress_path.with_name(
+        progress_path.stem.replace(".progress", "") + ".skip_funnel.json"
+    )
+    skip_funnel_markdown_path = (
+        Path(args.skip_funnel_markdown_path)
+        if args.skip_funnel_markdown_path
+        else skip_funnel_path.with_suffix(".md")
+    )
+    chain_richness_path = (
+        Path(args.chain_richness_path)
+        if args.chain_richness_path
+        else progress_path.with_name(progress_path.stem.replace(".progress", "") + ".chain_richness.json")
+    )
+    chain_richness_markdown_path = (
+        Path(args.chain_richness_markdown_path)
+        if args.chain_richness_markdown_path
+        else chain_richness_path.with_suffix(".md")
+    )
 
     config = _build_config(args)
     schema = _build_schema(sorted_csv)
@@ -134,9 +172,24 @@ def main() -> None:
             started,
             stage="complete",
         )
+        summary["skip_funnel_path"] = str(skip_funnel_path)
+        summary["skip_funnel_markdown_path"] = str(skip_funnel_markdown_path)
+        summary["chain_richness_path"] = str(chain_richness_path)
+        summary["chain_richness_markdown_path"] = str(chain_richness_markdown_path)
+        skip_funnel_report = index.skip_funnel_report()
+        chain_richness_report = index.chain_richness_report()
         writer.write_metadata("build_summary", summary)
+        writer.write_metadata("skip_funnel", skip_funnel_report)
+        writer.write_metadata("chain_richness", chain_richness_report)
         writer.flush()
         _save_json(progress_path, summary)
+        _save_json(skip_funnel_path, skip_funnel_report)
+        _save_json(chain_richness_path, chain_richness_report)
+        skip_funnel_markdown_path.write_text(_render_skip_funnel_markdown(skip_funnel_report), encoding="utf-8")
+        chain_richness_markdown_path.write_text(
+            _render_chain_richness_markdown(chain_richness_report),
+            encoding="utf-8",
+        )
 
     print(json.dumps(summary, indent=2, sort_keys=True))
 
@@ -212,6 +265,96 @@ def _progress_payload(
 
 def _save_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _render_skip_funnel_markdown(report: dict[str, object]) -> str:
+    stages = dict(report.get("stages", {}))
+    reject_reasons = dict(report.get("reject_reasons", {}))
+    candidate_types = dict(report.get("candidate_types", {}))
+    score_means = dict(report.get("score_means", {}))
+    selected_support = dict(report.get("selected_support", {}))
+    rates = dict(report.get("rates", {}))
+
+    lines: list[str] = []
+    lines.append("# Skip Funnel Report")
+    lines.append("")
+    lines.append(f"- Events processed: `{report.get('events_processed', 0)}`")
+    lines.append("")
+    lines.append("## Stage Counts")
+    lines.append("")
+    lines.append("| stage | count |")
+    lines.append("| --- | ---: |")
+    for stage, count in sorted(stages.items()):
+        lines.append(f"| {stage} | {count} |")
+    lines.append("")
+    lines.append("## Stage Rates")
+    lines.append("")
+    lines.append("| rate | value |")
+    lines.append("| --- | ---: |")
+    for name, value in sorted(rates.items()):
+        lines.append(f"| {name} | {float(value):.4f} |")
+    lines.append("")
+    lines.append("## Reject Reasons")
+    lines.append("")
+    lines.append("| reason | count |")
+    lines.append("| --- | ---: |")
+    for reason, count in sorted(reject_reasons.items()):
+        lines.append(f"| {reason} | {count} |")
+    lines.append("")
+    lines.append("## Candidate Types")
+    lines.append("")
+    lines.append("| stage | chain | event | other |")
+    lines.append("| --- | ---: | ---: | ---: |")
+    for stage, counts in sorted(candidate_types.items()):
+        lines.append(
+            f"| {stage} | {int(counts.get('chain', 0))} | {int(counts.get('event', 0))} | {int(counts.get('other', 0))} |"
+        )
+    lines.append("")
+    lines.append("## Score Means")
+    lines.append("")
+    for stage, means in sorted(score_means.items()):
+        lines.append(f"### {stage}")
+        lines.append("")
+        lines.append("| component | mean |")
+        lines.append("| --- | ---: |")
+        for name, value in sorted(means.items()):
+            lines.append(f"| {name} | {float(value):.4f} |")
+        lines.append("")
+    lines.append("## Selected Support")
+    lines.append("")
+    lines.append("| metric | value |")
+    lines.append("| --- | ---: |")
+    for name, value in sorted(selected_support.items()):
+        if isinstance(value, float):
+            lines.append(f"| {name} | {value:.4f} |")
+        else:
+            lines.append(f"| {name} | {value} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_chain_richness_markdown(report: dict[str, object]) -> str:
+    lines: list[str] = []
+    lines.append("# Chain Richness Report")
+    lines.append("")
+    lines.append("| stage | count | mean hops | max hops | mean order span | max order span | mean temporal span (s) | max temporal span (s) | mean rep events | max rep events |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    for stage, stats in sorted(report.items()):
+        values = dict(stats)
+        lines.append(
+            "| "
+            f"{stage} | "
+            f"{int(values.get('count', 0))} | "
+            f"{float(values.get('mean_hop_count', 0.0)):.2f} | "
+            f"{int(values.get('max_hop_count', 0))} | "
+            f"{float(values.get('mean_order_span', 0.0)):.2f} | "
+            f"{int(values.get('max_order_span', 0))} | "
+            f"{float(values.get('mean_temporal_span_seconds', 0.0)):.2f} | "
+            f"{float(values.get('max_temporal_span_seconds', 0.0)):.2f} | "
+            f"{float(values.get('mean_representative_event_count', 0.0)):.2f} | "
+            f"{int(values.get('max_representative_event_count', 0))} |"
+        )
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

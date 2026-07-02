@@ -202,6 +202,63 @@ def test_skip_candidate_index_prefers_query_participant_overlap() -> None:
     assert candidates[0] == "e1"
 
 
+def test_skip_candidate_index_prefers_richer_chain_bridge_over_newer_shallow_one() -> None:
+    config = StoreConfig(
+        anchor_candidates=4,
+        correlation_candidates=0,
+        rarity_candidates=0,
+        intent_candidates=4,
+        aspect_candidates=4,
+    )
+    index = SkipCandidateIndex(config)
+    intent = DecisionIntent(name="aml", aspects={"source_accumulation", "large_transfer"})
+
+    index.add_chain_anchor(
+        ChainSummary(
+            chain_id="c_rich",
+            family="transaction_flow",
+            head_id="e1",
+            tail_id="e5",
+            representative_event_ids=["e1", "e2", "e3", "e5"],
+            source_entities={"seed"},
+            destination_entities={"a"},
+            aspects={"source_accumulation", "large_transfer"},
+            dependency_confidence=0.7,
+            hop_count=4,
+            order_span=18,
+            temporal_span_seconds=172800.0,
+        ),
+        intent,
+    )
+    index.add_chain_anchor(
+        ChainSummary(
+            chain_id="c_shallow",
+            family="transaction_flow",
+            head_id="e8",
+            tail_id="e9",
+            representative_event_ids=["e8", "e9"],
+            source_entities={"seed"},
+            destination_entities={"a"},
+            aspects={"source_accumulation", "large_transfer"},
+            dependency_confidence=0.9,
+            hop_count=1,
+            order_span=1,
+            temporal_span_seconds=60.0,
+        ),
+        intent,
+    )
+
+    query = make_record(
+        "e20",
+        aspects={"large_transfer"},
+        attrs={"src_account": "a", "dst_account": "sink"},
+    )
+    candidates = index.get_skip_candidates(query, intent, ordinary_predecessors=[])
+
+    assert candidates
+    assert candidates[0] == "c_rich"
+
+
 def test_event_store_expire_purges_records_from_memory() -> None:
     store = EventStore()
     for event_id in ("e1", "e2", "e3"):

@@ -101,6 +101,40 @@ def test_extract_aspects_falls_back_to_generic_evidence() -> None:
     assert aspects == {"generic_evidence"}
 
 
+def test_extract_aspects_for_lanl_auth_event() -> None:
+    event = Event(
+        event_id="lanl-1",
+        time=151036,
+        event_type="authentication",
+        attrs={
+            "src_user": "u748",
+            "dst_user": "u748",
+            "src_computer": "c17693",
+            "dst_computer": "c305",
+            "auth_type": "NTLM",
+            "logon_type": "Network",
+            "auth_orientation": "LogOn",
+            "success": True,
+            "is_cross_host_auth": True,
+            "is_new_dst_for_user": True,
+            "prior_user_event_count": 6,
+            "prior_user_host_count": 2,
+            "prior_pair_seen": False,
+            "is_machine_account": False,
+            "is_anonymous_logon": False,
+        },
+        text="user u748 authenticated as u748 from c17693 to c305 via NTLM success=true",
+    )
+
+    aspects = extract_aspects(event)
+
+    assert "credential_reuse" in aspects
+    assert "new_host_access" in aspects
+    assert "lateral_movement" in aspects
+    assert "rare_auth_path" in aspects
+    assert "privilege_spread" in aspects
+
+
 def test_featurize_event_builds_complete_event_record() -> None:
     config = ExtractorConfig(sketch_dim=16, time_bucket_width=50)
     event = Event(
@@ -188,3 +222,44 @@ def test_extract_keys_does_not_treat_bank_columns_as_entity_endpoints() -> None:
     assert "ctx:dst_bank=bank_1" not in keys
     assert "attr:src_bank=bank_1" in keys
     assert "attr:dst_bank=bank_1" in keys
+
+
+def test_extract_keys_treats_computers_as_flow_endpoints() -> None:
+    event = Event(
+        event_id="lanl-2",
+        time=10,
+        event_type="authentication",
+        attrs={
+            "src_user": "alice",
+            "src_computer": "c1",
+            "dst_computer": "c2",
+        },
+    )
+
+    keys = extract_keys(event, ExtractorConfig())
+
+    assert "entity:src_computer=c1" in keys
+    assert "entity:dst_computer=c2" in keys
+    assert "participant:c1" in keys
+    assert "participant:c2" in keys
+    assert "flow_pair:c1->c2" in keys
+
+
+def test_featurize_event_populates_computer_flow_entities() -> None:
+    event = Event(
+        event_id="lanl-3",
+        time=10,
+        event_type="authentication",
+        attrs={
+            "src_user": "alice",
+            "dst_user": "bob",
+            "src_computer": "c1",
+            "dst_computer": "c2",
+        },
+    )
+
+    record = featurize_event(event, ExtractorConfig())
+
+    assert record.source_entities == frozenset({"alice", "c1"})
+    assert record.destination_entities == frozenset({"bob", "c2"})
+    assert record.participant_entities == frozenset({"alice", "c1", "bob", "c2"})

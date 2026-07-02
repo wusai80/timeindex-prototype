@@ -6,3 +6,5 @@ __pycache__/
 key(not for uploaded to github).md
 outputs/
 data/ibm_aml/
+data/lanl/
+data/.DS_Store

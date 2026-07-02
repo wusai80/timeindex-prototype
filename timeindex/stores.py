@@ -15,6 +15,7 @@ class EventStore:
     def __init__(self) -> None:
         self._records: dict[str, EventRecord] = {}
         self._insertion_order: list[str] = []
+        self._active_start = 0
         self._next_order = 0
 
     def insert(self, record: EventRecord) -> None:
@@ -47,37 +48,59 @@ class EventStore:
         return self.contains(event_id)
 
     def __len__(self) -> int:
-        return len(self._insertion_order)
+        return len(self._records)
 
     def expire(self, event_ids: Iterable[str] | None = None, max_size: int | None = None) -> list[str]:
         """Expire records by id or active-size budget and purge them from memory."""
 
         expired_ids: list[str] = []
-        pending = set(event_ids or ())
+        expired_lookup: set[str] = set()
+        pending = {str(event_id) for event_id in (event_ids or ())}
 
         if max_size is not None and max_size >= 0:
-            overflow = max(0, len(self._insertion_order) - max_size)
-            if overflow > 0:
-                pending.update(self._insertion_order[:overflow])
+            overflow = max(0, len(self._records) - max_size)
+            while overflow > 0 and self._active_start < len(self._insertion_order):
+                event_id = self._insertion_order[self._active_start]
+                self._active_start += 1
+                record = self._records.get(event_id)
+                if record is None or record.metadata.expired:
+                    continue
+                record.metadata.expired = True
+                expired_ids.append(event_id)
+                expired_lookup.add(event_id)
+                del self._records[event_id]
+                overflow -= 1
 
-        for event_id in list(self._insertion_order):
-            if event_id not in pending:
+        for event_id in pending:
+            if event_id in expired_lookup:
                 continue
             record = self._records.get(event_id)
             if record is None or record.metadata.expired:
                 continue
             record.metadata.expired = True
             expired_ids.append(event_id)
+            expired_lookup.add(event_id)
             del self._records[event_id]
 
-        if expired_ids:
-            expired_lookup = set(expired_ids)
-            self._insertion_order = [event_id for event_id in self._insertion_order if event_id not in expired_lookup]
-
+        self._compact_insertion_order()
         return expired_ids
 
     def list(self) -> Sequence[EventRecord]:
-        return [self._records[event_id] for event_id in self._insertion_order if self.is_valid(event_id)]
+        return [
+            record
+            for event_id in self._insertion_order[self._active_start :]
+            for record in [self._records.get(event_id)]
+            if record is not None and not record.metadata.expired
+        ]
+
+    def _compact_insertion_order(self) -> None:
+        if self._active_start <= 0:
+            return
+        remaining = len(self._insertion_order) - self._active_start
+        if self._active_start < 1024 and self._active_start < remaining:
+            return
+        self._insertion_order = self._insertion_order[self._active_start :]
+        self._active_start = 0
 
 
 class KeyDirectory:

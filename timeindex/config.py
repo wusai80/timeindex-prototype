@@ -26,6 +26,9 @@ class ScoringConfig:
     anchor_threshold: float = 0.45
     retrieval_stop_threshold: float = 0.05
     time_decay: float = 100.0
+    skip_lanl_temporal_gain_scale: float = 400.0
+    skip_lanl_high_baseline_events: int = 20
+    skip_lanl_high_baseline_hosts: int = 8
     options: dict[str, Any] = field(default_factory=dict)
 
 
@@ -51,6 +54,7 @@ class ConstructionConfig:
 
     maintain_outgoing_links: bool = True
     expire_stale_items: bool = True
+    expire_batch_size: int = 0
     enable_skip_links: bool = True
     enable_bridge_score: bool = True
     enable_aspect_candidates: bool = True
@@ -58,6 +62,10 @@ class ConstructionConfig:
     enable_correlation_candidates: bool = True
     skip_candidate_pool_factor: int = 3
     skip_summary_event_limit: int = 4
+    skip_min_representative_events: int = 2
+    skip_min_single_event_time_gap_seconds: float = 3600.0
+    skip_min_single_event_order_gap: int = 4
+    prefer_chain_skip_candidates: bool = True
     options: dict[str, Any] = field(default_factory=dict)
 
 

@@ -12,7 +12,7 @@ import numpy as np
 from .config import ExtractorConfig
 from .event import Event, EventRecord
 
-_ENTITY_FIELD_TOKENS = ("id", "account", "user", "host", "service", "device")
+_ENTITY_FIELD_TOKENS = ("id", "account", "user", "host", "service", "device", "computer", "machine")
 _CONTEXT_FIELD_TOKENS = (
     "ctx",
     "context",
@@ -37,6 +37,10 @@ _SOURCE_ENDPOINT_FIELDS = (
     "sender_account",
     "src_user",
     "source_user",
+    "src_computer",
+    "source_computer",
+    "from_computer",
+    "origin_computer",
 )
 _DESTINATION_ENDPOINT_FIELDS = (
     "dst_account",
@@ -50,6 +54,10 @@ _DESTINATION_ENDPOINT_FIELDS = (
     "target_account",
     "dst_user",
     "target_user",
+    "dst_computer",
+    "destination_computer",
+    "target_computer",
+    "to_computer",
 )
 
 
@@ -170,6 +178,29 @@ def extract_aspects(event: Event) -> set[str]:
     if (metric_delta is not None and abs(metric_delta) >= 0.25) or "metric shift" in text:
         aspects.add("metric_shift")
 
+    cross_host = _get_bool(attrs, "is_cross_host_auth")
+    new_host = _get_bool(attrs, "is_new_dst_for_user", "is_new_host")
+    machine_account = _get_bool(attrs, "is_machine_account")
+    anonymous_logon = _get_bool(attrs, "is_anonymous_logon")
+    pair_seen = _get_bool(attrs, "prior_pair_seen")
+    prior_user_events = _get_numeric(attrs, "prior_user_event_count")
+    prior_user_hosts = _get_numeric(attrs, "prior_user_host_count")
+    auth_type = _normalize_scalar(attrs.get("auth_type", "")) if attrs.get("auth_type") is not None else ""
+    logon_type = _normalize_scalar(attrs.get("logon_type", "")) if attrs.get("logon_type") is not None else ""
+
+    if cross_host and success_like(attrs, text) and not machine_account and not anonymous_logon:
+        aspects.add("credential_reuse")
+    if cross_host and new_host and success_like(attrs, text) and not anonymous_logon:
+        aspects.add("new_host_access")
+    if cross_host and new_host and success_like(attrs, text) and ((prior_user_hosts or 0.0) >= 1.0):
+        aspects.add("lateral_movement")
+    if cross_host and success_like(attrs, text) and ((prior_user_events or 0.0) >= 3.0):
+        aspects.add("rare_auth_path")
+    if auth_type in {"ntlm", "?", "negotiate"} and cross_host:
+        aspects.add("rare_auth_path")
+    if logon_type in {"network", "remoteinteractive", "service"} and cross_host and not pair_seen:
+        aspects.add("privilege_spread")
+
     if routine:
         aspects.discard("beneficiary_novelty")
 
@@ -285,3 +316,10 @@ def _safe_ratio(numerator: float | None, denominator: float | None) -> float:
 
 def _matches_any(text: str, phrases: tuple[str, ...]) -> bool:
     return any(phrase in text for phrase in phrases)
+
+
+def success_like(attrs: dict[str, Any], text: str) -> bool:
+    success = attrs.get("success")
+    if isinstance(success, bool):
+        return success
+    return "success=true" in text or " success " in f" {text} "

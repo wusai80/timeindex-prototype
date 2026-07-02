@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import datetime
 import heapq
@@ -60,6 +61,7 @@ class TimeIndex:
         self._featurize_event_impl = self._bind_module_function("timeindex.extractors", "featurize_event")
         self._dependency_score_impl = self._bind_module_function("timeindex.scoring", "dependency_score")
         self._skip_score_impl = self._bind_module_function("timeindex.scoring", "skip_score")
+        self._skip_score_breakdown_impl = self._bind_module_function("timeindex.scoring", "skip_score_breakdown")
         self._anchor_score_impl = self._bind_module_function("timeindex.scoring", "anchor_score")
         self._rarity_score_impl = self._bind_module_function("timeindex.scoring", "rarity_score")
         self._event_get = self._bind_first(self.event_store, ("get",))
@@ -89,8 +91,12 @@ class TimeIndex:
         self._skip_link_incoming = self._bind_first(self.skip_link_store, ("incoming", "incoming_links"))
         self._skip_link_insert = self._bind_first(self.skip_link_store, ("insert", "add"))
         self._insertion_order = 0
+        self._last_expired_ids: list[str] = []
+        self._skip_funnel_stats = self._new_skip_funnel_stats()
+        self._chain_richness_stats = self._new_chain_richness_stats()
 
     def insert(self, event: Event) -> EventRecord:
+        self._skip_funnel_stats["events_processed"] += 1
         record = self._featurize_event(event)
         ordinary_candidates = self._local_candidate_records(record)
         ordinary_links = self._select_ordinary_links(record, ordinary_candidates)
@@ -122,9 +128,57 @@ class TimeIndex:
         links = self._skip_link_incoming(event_id) if self._skip_link_incoming is not None else None
         return list(links or [])
 
+    def skip_funnel_report(self) -> dict[str, Any]:
+        stages = dict(self._skip_funnel_stats["stages"])
+        report = {
+            "events_processed": int(self._skip_funnel_stats["events_processed"]),
+            "stages": stages,
+            "reject_reasons": dict(self._skip_funnel_stats["reject_reasons"]),
+            "candidate_types": {
+                stage: dict(counter)
+                for stage, counter in self._skip_funnel_stats["candidate_types"].items()
+            },
+            "score_means": self._score_mean_report(),
+            "selected_support": self._selected_support_report(),
+        }
+        raw = max(1, int(stages.get("raw_candidates", 0)))
+        report["rates"] = {
+            "forward_validation_pass_rate": float(stages.get("forward_validated_candidates", 0)) / raw,
+            "dedupe_retention_rate": float(stages.get("deduped_candidates", 0)) / max(
+                1,
+                int(stages.get("forward_validated_candidates", 0)),
+            ),
+            "causal_pass_rate": float(stages.get("causal_candidates", 0)) / max(
+                1,
+                int(stages.get("candidate_pool_kept", 0)),
+            ),
+            "nontrivial_pass_rate": float(stages.get("nontrivial_candidates", 0)) / max(
+                1,
+                int(stages.get("causal_candidates", 0)),
+            ),
+            "threshold_pass_rate": float(stages.get("above_threshold_candidates", 0)) / max(
+                1,
+                int(stages.get("scored_candidates", 0)),
+            ),
+            "topk_retention_rate": float(stages.get("selected_links", 0)) / max(
+                1,
+                int(stages.get("above_threshold_candidates", 0)),
+            ),
+        }
+        return report
+
+    def chain_richness_report(self) -> dict[str, Any]:
+        return {
+            stage: self._chain_stage_report(stats)
+            for stage, stats in self._chain_richness_stats.items()
+        }
+
     def chains(self, event_id: str) -> list[ChainSummary]:
         chains = self._chain_get_for_tail(event_id) if self._chain_get_for_tail is not None else None
         return list(chains or [])
+
+    def recent_expired_ids(self) -> list[str]:
+        return list(self._last_expired_ids)
 
     def _build_extractor(self, config: TimeIndexConfig) -> Any:
         try:
@@ -381,6 +435,9 @@ class TimeIndex:
                 destination_entities.update(inherited.destination_entities)
                 inherited_aspects.update(inherited.aspects)
                 dependency_confidence = min(link.score, float(inherited.dependency_confidence or link.score))
+            hop_count = self._chain_hop_count(inherited)
+            order_span = self._chain_order_span(inherited, predecessor, record)
+            temporal_span_seconds = self._chain_temporal_span_seconds(inherited, predecessor, record)
             summary = ChainSummary(
                 chain_id=f"{link.predecessor_id}->{record.event.event_id}:{position}",
                 family=family,
@@ -391,12 +448,16 @@ class TimeIndex:
                 destination_entities=destination_entities,
                 aspects=inherited_aspects | set(predecessor.aspects) | set(record.aspects),
                 dependency_confidence=dependency_confidence,
+                hop_count=hop_count,
+                order_span=order_span,
+                temporal_span_seconds=temporal_span_seconds,
                 summary=f"{family} chain from {(inherited.head_id if inherited is not None else predecessor.event.event_id)} to {record.event.event_id}",
                 cost=float(max(1, len(representative_ids))),
             )
             if self._chain_add is not None:
                 self._chain_add(summary)
             new_chains.append(summary)
+            self._accumulate_chain_richness("created_chains", summary)
             if len(new_chains) >= limit:
                 break
         return new_chains
@@ -434,6 +495,41 @@ class TimeIndex:
             compact.append(event_id)
         limit = max(1, self.config.construction.skip_summary_event_limit)
         return compact[-limit:]
+
+    def _chain_hop_count(self, inherited: ChainSummary | None) -> int:
+        if inherited is None:
+            return 1
+        return max(1, int(getattr(inherited, "hop_count", 1)) + 1)
+
+    def _chain_order_span(
+        self,
+        inherited: ChainSummary | None,
+        predecessor: EventRecord,
+        current: EventRecord,
+    ) -> int:
+        predecessor_order = self._event_order(predecessor)
+        current_order = self._event_order(current)
+        direct_span = max(0, current_order - predecessor_order)
+        if inherited is None:
+            return direct_span
+        inherited_span = max(0, int(getattr(inherited, "order_span", 0)))
+        return max(direct_span, inherited_span + direct_span)
+
+    def _chain_temporal_span_seconds(
+        self,
+        inherited: ChainSummary | None,
+        predecessor: EventRecord,
+        current: EventRecord,
+    ) -> float:
+        current_time = self._epoch_like_time(current.event.time)
+        predecessor_time = self._epoch_like_time(predecessor.event.time)
+        if current_time is None or predecessor_time is None:
+            return 0.0
+        direct_span = max(0.0, float(current_time - predecessor_time))
+        if inherited is None:
+            return direct_span
+        inherited_span = max(0.0, float(getattr(inherited, "temporal_span_seconds", 0.0)))
+        return max(direct_span, inherited_span + direct_span)
 
     def _should_inherit_chain(
         self,
@@ -477,19 +573,115 @@ class TimeIndex:
         if result is None:
             if self._skip_candidate_retrieve is not None:
                 result = self._skip_candidate_retrieve(record, intent)
+        raw_candidates = list(result or [])
+        local_bridge_candidates = self._local_bridge_skip_candidates(record, ordinary_links)
+        raw_candidates.extend(local_bridge_candidates)
+        self._bump_skip_stage("raw_candidates", len(raw_candidates))
+        self._bump_skip_stage("local_bridge_candidates", len(local_bridge_candidates))
+        for candidate in raw_candidates:
+            self._bump_skip_candidate_type("raw_candidates", candidate)
         candidates: list[Any] = []
         ordinary_predecessor_records = [
             predecessor
             for predecessor in (self.get_event(link.predecessor_id) for link in ordinary_links)
             if predecessor is not None
         ]
-        for candidate in list(result or []):
+        for candidate in raw_candidates:
             resolved = self._resolve_candidate(candidate)
             if resolved is not None:
                 if self._forward_validates_skip_candidate(resolved, record, ordinary_predecessor_records):
                     candidates.append(resolved)
+                    self._bump_skip_stage("forward_validated_candidates")
+                    self._bump_skip_candidate_type("forward_validated_candidates", resolved)
+                else:
+                    self._bump_skip_reject("forward_validation_failed")
+        deduped = self._dedupe_skip_candidates(candidates)
+        self._bump_skip_stage("deduped_candidates", len(deduped))
+        for candidate in deduped:
+            self._bump_skip_candidate_type("deduped_candidates", candidate)
         limit = max(1, self.config.stores.skip_fan_in * self.config.construction.skip_candidate_pool_factor)
-        return self._dedupe_skip_candidates(candidates)[:limit]
+        pooled = deduped[:limit]
+        self._bump_skip_stage("candidate_pool_kept", len(pooled))
+        self._bump_skip_stage("candidate_pool_dropped", max(0, len(deduped) - len(pooled)))
+        for candidate in pooled:
+            self._bump_skip_candidate_type("candidate_pool_kept", candidate)
+        return pooled
+
+    def _local_bridge_skip_candidates(
+        self,
+        record: EventRecord,
+        ordinary_links: Sequence[OrdinaryLink],
+    ) -> list[Any]:
+        if self._entity_recent_destinations is None:
+            return []
+
+        excluded_ids = {record.event.event_id, *(link.predecessor_id for link in ordinary_links)}
+        limit = max(4, self.config.stores.skip_fan_in * self.config.construction.skip_candidate_pool_factor)
+        candidates: list[Any] = []
+        seen: set[tuple[str, str]] = set()
+
+        for entity in sorted(record.source_entities):
+            recent_ids = list(self._entity_recent_destinations(entity) or [])
+            for event_id in recent_ids:
+                if event_id in excluded_ids:
+                    continue
+                bridge_record = self.get_event(str(event_id))
+                if bridge_record is None or not self._is_valid_event(bridge_record):
+                    continue
+                if not self._is_causal_predecessor(bridge_record, record):
+                    continue
+                if not (set(bridge_record.destination_entities) & set(record.source_entities)):
+                    continue
+
+                chain_candidate = self._best_local_bridge_chain(bridge_record, record)
+                if chain_candidate is not None:
+                    signature = ("chain", chain_candidate.chain_id)
+                    if signature not in seen:
+                        candidates.append(chain_candidate)
+                        seen.add(signature)
+
+                signature = ("event", bridge_record.event.event_id)
+                if signature not in seen:
+                    candidates.append(bridge_record)
+                    seen.add(signature)
+
+                if len(candidates) >= limit:
+                    return candidates
+        return candidates
+
+    def _best_local_bridge_chain(
+        self,
+        bridge_record: EventRecord,
+        target: EventRecord,
+    ) -> ChainSummary | None:
+        if self._chain_get_for_tail is None:
+            return None
+        summaries = list(self._chain_get_for_tail(bridge_record.event.event_id) or [])
+        if not summaries:
+            return None
+
+        viable = [
+            summary
+            for summary in summaries
+            if summary.head_id != bridge_record.event.event_id
+            or len(summary.representative_event_ids) > 1
+        ]
+        if not viable:
+            viable = summaries
+        viable = [summary for summary in viable if self._candidate_is_causal(summary, target)]
+        if not viable:
+            return None
+        viable.sort(
+            key=lambda item: (
+                -self._candidate_support_size(item),
+                -int(getattr(item, "hop_count", 0)),
+                -int(getattr(item, "order_span", 0)),
+                -float(getattr(item, "temporal_span_seconds", 0.0)),
+                -float(item.dependency_confidence),
+                item.chain_id,
+            )
+        )
+        return viable[0]
 
     def _select_skip_links(
         self,
@@ -511,19 +703,39 @@ class TimeIndex:
         )
         for candidate in candidates:
             if self._candidate_id(candidate) == record.event.event_id:
+                self._bump_skip_reject("self_candidate")
                 continue
             if not self._candidate_is_causal(candidate, record):
+                self._bump_skip_reject("noncausal_candidate")
                 continue
-            score = self._skip_score(candidate, record, self.default_intent, score_predecessors)
+            self._bump_skip_stage("causal_candidates")
+            self._bump_skip_candidate_type("causal_candidates", candidate)
+            candidate_event_ids = self._bounded_skip_event_ids(self._candidate_event_ids(candidate), record)
+            if not self._is_nontrivial_skip_candidate(candidate, candidate_event_ids, record):
+                self._bump_skip_reject("trivial_candidate")
+                continue
+            self._bump_skip_stage("nontrivial_candidates")
+            self._bump_skip_candidate_type("nontrivial_candidates", candidate)
+            breakdown = self._skip_score_breakdown(candidate, record, self.default_intent, score_predecessors)
+            score = float(breakdown.get("score", 0.0))
+            self._bump_skip_stage("scored_candidates")
+            self._bump_skip_candidate_type("scored_candidates", candidate)
+            self._accumulate_skip_score_breakdown("scored_candidates", breakdown)
             if score >= threshold:
                 scored.append((score, candidate))
+                self._bump_skip_stage("above_threshold_candidates")
+                self._bump_skip_candidate_type("above_threshold_candidates", candidate)
+                self._accumulate_skip_score_breakdown("above_threshold_candidates", breakdown)
+            else:
+                self._bump_skip_reject("below_threshold")
 
         limit = self.config.stores.skip_fan_in
         top_scored = heapq.nsmallest(
             limit,
             scored,
-            key=lambda item: (-item[0], -self._candidate_order(item[1]), self._candidate_id(item[1])),
+            key=lambda item: (-item[0], -self._candidate_order(item[1]), self._candidate_anchor_id(item[1])),
         )
+        self._bump_skip_stage("topk_dropped_candidates", max(0, len(scored) - len(top_scored)))
         links: list[SkipLink] = []
         for score, candidate in top_scored:
             candidate_event_ids = self._candidate_event_ids(candidate)
@@ -531,7 +743,7 @@ class TimeIndex:
             segment_confidence = self._candidate_segment_confidence(candidate, record)
             links.append(
                 SkipLink(
-                    from_id=self._candidate_id(candidate),
+                    from_id=self._candidate_anchor_id(candidate),
                     to_id=record.event.event_id,
                     skip_value=score,
                     segment_confidence=segment_confidence,
@@ -542,6 +754,13 @@ class TimeIndex:
                     representative_event_ids=candidate_event_ids,
                     cost=float(1.0 + 0.25 * max(0, len(candidate_event_ids) - 1)),
                 )
+            )
+            self._bump_skip_stage("selected_links")
+            self._bump_skip_candidate_type("selected_links", candidate)
+            self._accumulate_selected_support(candidate_event_ids)
+            self._accumulate_skip_score_breakdown(
+                "selected_links",
+                self._skip_score_breakdown(candidate, record, self.default_intent, score_predecessors),
             )
         return links
 
@@ -573,17 +792,26 @@ class TimeIndex:
             if self._skip_candidate_add_event_anchor is not None:
                 self._skip_candidate_add_event_anchor(record, self.default_intent)
                 existing_anchors = [*existing_anchors, record]
+        if not self.config.construction.enable_bridge_score:
+            return
         for chain in new_chains:
             if self._anchor_score(chain, existing_anchors) >= self.config.scoring.anchor_threshold:
                 if self._skip_candidate_add_chain_anchor is not None:
                     self._skip_candidate_add_chain_anchor(chain, self.default_intent)
+                    self._accumulate_chain_richness("anchored_chains", chain)
                     existing_anchors = [*existing_anchors, chain]
 
     def _expire_if_needed(self) -> None:
+        self._last_expired_ids = []
         if not self.config.construction.expire_stale_items:
             return
         active_history_size = self.config.stores.active_history_size
-        if self._active_event_count() <= active_history_size:
+        active_event_count = self._active_event_count()
+        if active_event_count <= active_history_size:
+            return
+        expire_batch_size = max(0, int(self.config.construction.expire_batch_size))
+        overflow = max(0, active_event_count - active_history_size)
+        if expire_batch_size > 0 and overflow < expire_batch_size:
             return
         expired_ids: list[str] = []
         if self._event_expire is not None:
@@ -591,6 +819,7 @@ class TimeIndex:
                 expired_ids = list(self._event_expire(max_size=active_history_size) or [])
             except TypeError:
                 expired_ids = list(self._event_expire(active_history_size) or [])
+        self._last_expired_ids = list(expired_ids)
 
         if self._key_expire is not None:
             try:
@@ -624,8 +853,9 @@ class TimeIndex:
         intent: DecisionIntent,
         ordinary_predecessors: Sequence[str],
     ) -> float:
-        if self._skip_score_impl is not None:
-            return float(self._skip_score_impl(candidate, target, intent, ordinary_predecessors, self.config.scoring))
+        breakdown = self._skip_score_breakdown(candidate, target, intent, ordinary_predecessors)
+        if "score" in breakdown:
+            return float(breakdown["score"])
         try:
             return float(self.scorer.score_skip(candidate, target, intent))
         except NotImplementedError:
@@ -633,6 +863,37 @@ class TimeIndex:
             predecessor_ids = {self._candidate_id(item) for item in ordinary_predecessors}
             bonus = 0.1 if self._candidate_id(candidate) not in predecessor_ids else 0.0
             return min(1.0, base + bonus)
+
+    def _skip_score_breakdown(
+        self,
+        candidate: Any,
+        target: EventRecord,
+        intent: DecisionIntent,
+        ordinary_predecessors: Sequence[Any],
+    ) -> dict[str, float]:
+        if self._should_use_skip_score_breakdown():
+            return dict(
+                self._skip_score_breakdown_impl(
+                    candidate,
+                    target,
+                    intent,
+                    ordinary_predecessors,
+                    self.config.scoring,
+                )
+            )
+        if self._skip_score_impl is not None:
+            return {
+                "score": float(
+                    self._skip_score_impl(candidate, target, intent, ordinary_predecessors, self.config.scoring)
+                )
+            }
+        try:
+            return {"score": float(self.scorer.score_skip(candidate, target, intent))}
+        except NotImplementedError:
+            base = self._fallback_dependency_score(self._candidate_record(candidate), target)
+            predecessor_ids = {self._candidate_id(item) for item in ordinary_predecessors}
+            bonus = 0.1 if self._candidate_id(candidate) not in predecessor_ids else 0.0
+            return {"score": min(1.0, base + bonus)}
 
     def _anchor_score(
         self,
@@ -695,6 +956,20 @@ class TimeIndex:
         if isinstance(candidate, EventRecord):
             return candidate.event.event_id
         return str(candidate)
+
+    def _candidate_anchor_id(self, candidate: Any) -> str:
+        resolved = self._resolve_candidate(candidate)
+        if resolved is not candidate:
+            return self._candidate_anchor_id(resolved)
+        if isinstance(candidate, EventRecord):
+            return candidate.event.event_id
+        chain_id = getattr(candidate, "chain_id", None)
+        if chain_id is not None:
+            return str(chain_id)
+        object_id = getattr(candidate, "object_id", None)
+        if object_id is not None:
+            return str(object_id)
+        return self._candidate_id(candidate)
 
     def _candidate_order(self, candidate: Any) -> int:
         resolved = self._resolve_candidate(candidate)
@@ -781,20 +1056,70 @@ class TimeIndex:
         return False
 
     def _dedupe_skip_candidates(self, candidates: Sequence[Any]) -> list[Any]:
-        deduped: dict[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], Any] = {}
+        deduped: dict[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], str], Any] = {}
         for candidate in candidates:
             signature = (
                 tuple(sorted(str(value) for value in self._candidate_source_entities(candidate))),
                 tuple(sorted(str(value) for value in self._candidate_destination_entities(candidate))),
                 tuple(sorted(str(value) for value in self._candidate_aspects(candidate))),
+                self._candidate_root_id(candidate),
             )
             existing = deduped.get(signature)
-            if existing is None or self._candidate_order(candidate) > self._candidate_order(existing):
+            if existing is None or self._prefer_skip_candidate(candidate, existing):
                 deduped[signature] = candidate
         return sorted(
             deduped.values(),
             key=lambda item: (-self._candidate_order(item), self._candidate_id(item)),
         )
+
+    def _prefer_skip_candidate(self, candidate: Any, existing: Any) -> bool:
+        if self.config.construction.prefer_chain_skip_candidates:
+            candidate_is_chain = isinstance(self._resolve_candidate(candidate), ChainSummary)
+            existing_is_chain = isinstance(self._resolve_candidate(existing), ChainSummary)
+            if candidate_is_chain != existing_is_chain:
+                return candidate_is_chain
+
+        candidate_support = self._candidate_support_size(candidate)
+        existing_support = self._candidate_support_size(existing)
+        if candidate_support != existing_support:
+            return candidate_support > existing_support
+        return self._candidate_order(candidate) > self._candidate_order(existing)
+
+    def _candidate_support_size(self, candidate: Any) -> int:
+        resolved = self._resolve_candidate(candidate)
+        if isinstance(resolved, EventRecord):
+            return 1
+        event_ids = getattr(resolved, "representative_event_ids", None)
+        if event_ids:
+            return len({str(event_id) for event_id in event_ids})
+        return 1
+
+    def _candidate_root_id(self, candidate: Any) -> str:
+        resolved = self._resolve_candidate(candidate)
+        if isinstance(resolved, ChainSummary):
+            if resolved.representative_event_ids:
+                return str(resolved.representative_event_ids[0])
+            return str(resolved.head_id)
+        if isinstance(resolved, EventRecord):
+            return resolved.event.event_id
+        return self._candidate_anchor_id(resolved)
+
+    def _is_nontrivial_skip_candidate(
+        self,
+        candidate: Any,
+        candidate_event_ids: Sequence[str],
+        target: EventRecord,
+    ) -> bool:
+        min_events = max(1, int(self.config.construction.skip_min_representative_events))
+        if len(candidate_event_ids) >= min_events:
+            return True
+
+        time_gap_seconds = self._candidate_time_gap_seconds(candidate, target, candidate_event_ids)
+        if time_gap_seconds is not None:
+            return time_gap_seconds >= float(self.config.construction.skip_min_single_event_time_gap_seconds)
+
+        order_gap = self._candidate_order_gap(candidate, target)
+        return order_gap >= max(1, int(self.config.construction.skip_min_single_event_order_gap))
 
     def _bounded_skip_event_ids(self, candidate_event_ids: Sequence[str], target: EventRecord) -> list[str]:
         bounded = [
@@ -814,6 +1139,43 @@ class TimeIndex:
         if "bridge" not in base.lower():
             base = f"{base} [bridge={score:.2f}]"
         return base
+
+    def _candidate_order_gap(self, candidate: Any, target: EventRecord) -> int:
+        target_order = self._event_order(target)
+        candidate_order = self._candidate_order(candidate)
+        if target_order <= 0 or candidate_order <= 0:
+            return 0
+        return max(0, target_order - candidate_order)
+
+    def _candidate_time_gap_seconds(
+        self,
+        candidate: Any,
+        target: EventRecord,
+        candidate_event_ids: Sequence[str],
+    ) -> float | None:
+        target_time = self._epoch_like_time(target.event.time)
+        if target_time is None:
+            return None
+
+        candidate_times: list[float] = []
+        if candidate_event_ids:
+            for event_id in candidate_event_ids:
+                record = self.get_event(str(event_id))
+                if record is None:
+                    continue
+                parsed = self._epoch_like_time(record.event.time)
+                if parsed is not None:
+                    candidate_times.append(parsed)
+        if not candidate_times:
+            resolved = self._resolve_candidate(candidate)
+            if isinstance(resolved, EventRecord):
+                parsed = self._epoch_like_time(resolved.event.time)
+                if parsed is not None:
+                    candidate_times.append(parsed)
+
+        if not candidate_times:
+            return None
+        return max(0.0, target_time - max(candidate_times))
 
     def _entities_have_transaction_continuity(
         self,
@@ -874,7 +1236,7 @@ class TimeIndex:
         return bool(result)
 
     def _is_causal_predecessor(self, predecessor: EventRecord, current: EventRecord) -> bool:
-        return self._time_sort_key(predecessor.event.time) <= self._time_sort_key(current.event.time)
+        return self._time_sort_key(predecessor.event.time) < self._time_sort_key(current.event.time)
 
     def _candidate_is_causal(self, candidate: Any, target: EventRecord) -> bool:
         resolved = self._resolve_candidate(candidate)
@@ -978,6 +1340,161 @@ class TimeIndex:
             except ValueError:
                 continue
         return (1, text)
+
+    def _epoch_like_time(self, value: Any) -> float | None:
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            pass
+
+        for candidate in (text, text.replace("Z", "+00:00"), text.replace("/", "-")):
+            try:
+                return datetime.fromisoformat(candidate).timestamp()
+            except ValueError:
+                continue
+        return None
+
+    def _should_use_skip_score_breakdown(self) -> bool:
+        return callable(self._skip_score_breakdown_impl) and getattr(self._skip_score_impl, "__module__", "") == "timeindex.scoring"
+
+    def _new_skip_funnel_stats(self) -> dict[str, Any]:
+        return {
+            "events_processed": 0,
+            "stages": defaultdict(int),
+            "reject_reasons": defaultdict(int),
+            "candidate_types": defaultdict(lambda: defaultdict(int)),
+            "score_sums": defaultdict(lambda: defaultdict(float)),
+            "score_counts": defaultdict(int),
+            "selected_support": {
+                "count": 0,
+                "event_count_sum": 0.0,
+                "event_count_max": 0,
+            },
+        }
+
+    def _bump_skip_stage(self, stage: str, amount: int = 1) -> None:
+        self._skip_funnel_stats["stages"][stage] += int(amount)
+
+    def _bump_skip_reject(self, reason: str, amount: int = 1) -> None:
+        self._skip_funnel_stats["reject_reasons"][reason] += int(amount)
+
+    def _candidate_type_label(self, candidate: Any) -> str:
+        resolved = self._resolve_candidate(candidate)
+        if isinstance(resolved, ChainSummary):
+            return "chain"
+        if isinstance(resolved, EventRecord):
+            return "event"
+        return "other"
+
+    def _bump_skip_candidate_type(self, stage: str, candidate: Any) -> None:
+        self._skip_funnel_stats["candidate_types"][stage][self._candidate_type_label(candidate)] += 1
+
+    def _accumulate_skip_score_breakdown(self, stage: str, breakdown: dict[str, float]) -> None:
+        self._skip_funnel_stats["score_counts"][stage] += 1
+        for key, value in breakdown.items():
+            self._skip_funnel_stats["score_sums"][stage][key] += float(value)
+
+    def _accumulate_selected_support(self, candidate_event_ids: Sequence[str]) -> None:
+        support = self._skip_funnel_stats["selected_support"]
+        size = len(list(candidate_event_ids))
+        support["count"] += 1
+        support["event_count_sum"] += float(size)
+        support["event_count_max"] = max(int(support["event_count_max"]), int(size))
+
+    def _selected_support_report(self) -> dict[str, float]:
+        support = self._skip_funnel_stats["selected_support"]
+        count = int(support["count"])
+        return {
+            "count": count,
+            "mean_representative_event_count": (float(support["event_count_sum"]) / float(count)) if count else 0.0,
+            "max_representative_event_count": int(support["event_count_max"]),
+        }
+
+    def _score_mean_report(self) -> dict[str, dict[str, float]]:
+        report: dict[str, dict[str, float]] = {}
+        for stage, sums in self._skip_funnel_stats["score_sums"].items():
+            count = int(self._skip_funnel_stats["score_counts"][stage])
+            if count <= 0:
+                continue
+            report[stage] = {
+                key: float(total) / float(count)
+                for key, total in sums.items()
+            }
+        return report
+
+    def _new_chain_richness_stats(self) -> dict[str, dict[str, float]]:
+        return {
+            "created_chains": {
+                "count": 0.0,
+                "hop_count_sum": 0.0,
+                "hop_count_max": 0.0,
+                "order_span_sum": 0.0,
+                "order_span_max": 0.0,
+                "temporal_span_seconds_sum": 0.0,
+                "temporal_span_seconds_max": 0.0,
+                "representative_event_count_sum": 0.0,
+                "representative_event_count_max": 0.0,
+            },
+            "anchored_chains": {
+                "count": 0.0,
+                "hop_count_sum": 0.0,
+                "hop_count_max": 0.0,
+                "order_span_sum": 0.0,
+                "order_span_max": 0.0,
+                "temporal_span_seconds_sum": 0.0,
+                "temporal_span_seconds_max": 0.0,
+                "representative_event_count_sum": 0.0,
+                "representative_event_count_max": 0.0,
+            },
+        }
+
+    def _accumulate_chain_richness(self, stage: str, summary: ChainSummary) -> None:
+        stats = self._chain_richness_stats[stage]
+        rep_count = len(summary.representative_event_ids)
+        stats["count"] += 1.0
+        stats["hop_count_sum"] += float(summary.hop_count)
+        stats["hop_count_max"] = max(stats["hop_count_max"], float(summary.hop_count))
+        stats["order_span_sum"] += float(summary.order_span)
+        stats["order_span_max"] = max(stats["order_span_max"], float(summary.order_span))
+        stats["temporal_span_seconds_sum"] += float(summary.temporal_span_seconds)
+        stats["temporal_span_seconds_max"] = max(
+            stats["temporal_span_seconds_max"],
+            float(summary.temporal_span_seconds),
+        )
+        stats["representative_event_count_sum"] += float(rep_count)
+        stats["representative_event_count_max"] = max(stats["representative_event_count_max"], float(rep_count))
+
+    def _chain_stage_report(self, stats: dict[str, float]) -> dict[str, float]:
+        count = int(stats["count"])
+        if count <= 0:
+            return {
+                "count": 0,
+                "mean_hop_count": 0.0,
+                "max_hop_count": 0,
+                "mean_order_span": 0.0,
+                "max_order_span": 0,
+                "mean_temporal_span_seconds": 0.0,
+                "max_temporal_span_seconds": 0.0,
+                "mean_representative_event_count": 0.0,
+                "max_representative_event_count": 0,
+            }
+        return {
+            "count": count,
+            "mean_hop_count": stats["hop_count_sum"] / count,
+            "max_hop_count": int(stats["hop_count_max"]),
+            "mean_order_span": stats["order_span_sum"] / count,
+            "max_order_span": int(stats["order_span_max"]),
+            "mean_temporal_span_seconds": stats["temporal_span_seconds_sum"] / count,
+            "max_temporal_span_seconds": stats["temporal_span_seconds_max"],
+            "mean_representative_event_count": stats["representative_event_count_sum"] / count,
+            "max_representative_event_count": int(stats["representative_event_count_max"]),
+        }
 
     def _apply_construction_flags(self) -> None:
         if not self.config.construction.enable_skip_links:

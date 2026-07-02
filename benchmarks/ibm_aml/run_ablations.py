@@ -116,8 +116,6 @@ def _run_variant(
 def _build_index(events: list[Event], variant_name: str) -> TimeIndex:
     config = build_variant_config(variant_name)
     index = TimeIndex(config)
-    if not config.construction.enable_bridge_score:
-        index.skip_candidate_index.add_chain_anchor = lambda *args, **kwargs: None  # type: ignore[method-assign]
     for event in events:
         index.insert(event)
     return index

@@ -199,6 +199,121 @@ This optimization subsumes several standard hard problems.
 U(S ; Q) = \sum_{c \in S} v(c)
 \]
 
+
+Skip-link de-trivialization patch
+---------------------------------
+Problem
+-------
+The IBM AML 5M ablation diagnosis showed that skip links were usually not acting as true long-range compressed evidence.
+Most skip links were effectively single-event anchors:
+
+- about 91.5% of sampled skip links had only one representative event
+- about 81.6% used `Event anchor ...` summaries
+- `timeindex_full` and `timeindex_no_skip` returned identical event sets for about 90.4% of query-budget pairs
+
+This meant the skip layer was present in storage but rarely contributed distinct retrieval value.
+
+Implementation change
+---------------------
+We tightened skip-link construction so that single-event skip candidates are no longer accepted by default unless they
+are sufficiently separated from the target. Multi-event compressed skip summaries remain allowed.
+
+New construction defaults:
+- `skip_min_representative_events = 2`
+- `skip_min_single_event_time_gap_seconds = 3600`
+- `skip_min_single_event_order_gap = 4`
+- `prefer_chain_skip_candidates = True`
+
+Behavioral rules:
+1. Skip candidates with at least two representative events are still allowed.
+2. Single-event skip candidates are accepted only if:
+   - their timestamps are epoch-like and the time gap to the target is at least one hour, or
+   - timestamp units are not trustworthy and the insertion-order gap is at least four events.
+3. When multiple skip candidates share the same source/destination/aspect signature, we now prefer:
+   - chain summaries over raw event anchors
+   - larger representative support over smaller support
+   - newer candidates only after the two criteria above
+
+Why this is reasonable
+----------------------
+This patch moves skip links closer to their intended role:
+- compressed bridge evidence
+- not a second copy of near-local ordinary evidence
+
+It keeps deterministic construction while reducing low-value single-event skip anchors that compete with ordinary links
+without adding real historical breadth.
+
+Paper-facing interpretation
+---------------------------
+If this is reflected in the paper, skip links should be described as *non-trivial compressed bridge objects* rather than
+arbitrary long-range anchor pointers. In particular, the prototype now enforces a minimum evidence richness or temporal
+separation condition before storing a skip link.
+
+
+Skip funnel instrumentation
+---------------------------
+Problem
+-------
+After the de-trivialization patch, full retrieval and no-skip retrieval were still nearly identical on the IBM AML runs.
+At that point we needed instrumentation rather than more threshold guessing.
+
+Implementation change
+---------------------
+We added structured skip-funnel instrumentation to online construction:
+
+1. Per-stage counts:
+   - raw candidate retrieval
+   - forward validation pass
+   - deduped candidates
+   - candidate-pool truncation
+   - causal pass
+   - non-triviality pass
+   - score threshold pass
+   - final selected skip links
+
+2. Rejection counts:
+   - forward validation failure
+   - trivial candidate
+   - noncausal candidate
+   - below-threshold candidate
+   - self-candidate
+
+3. Candidate-type counts by stage:
+   - chain
+   - event
+   - other
+
+4. Skip-score component means by stage:
+   - corr
+   - impact
+   - novelty
+   - anchor_value
+   - best_ordinary_value
+   - bridge
+   - participant_bridge
+   - cost
+   - generic_penalty
+   - final score
+
+5. Selected-summary support statistics:
+   - number of selected skip links
+   - mean representative-event count
+   - max representative-event count
+
+Outputs
+-------
+The streaming SQLite builder now writes:
+- a JSON skip funnel report
+- a Markdown skip funnel report
+
+Interpretation
+--------------
+This instrumentation is intended to distinguish between two failure modes:
+- skip candidates are never reaching scoring
+- skip candidates are reaching scoring, but the value function is rejecting them
+
+This makes it possible to diagnose whether skip-link weakness is primarily a candidate-generation problem or a score-design problem.
+
    then the problem reduces directly to 0-1 knapsack.
 
 2. Budgeted maximum coverage reduction.
@@ -365,3 +480,365 @@ A suitable benchmark note is:
 \]
 
 This should be described as a benchmark-construction decision, not as a core retrieval algorithm change.
+
+
+Chain-summary richness and bridge-favoring skip generation
+----------------------------------------------------------
+Problem
+-------
+Skip-candidate retention had already been de-trivialized, but we still lacked direct instrumentation
+for the *richness* of chain summaries being created and anchored. That made it hard to answer two
+important questions:
+
+1. Are we actually constructing multi-hop / long-span chain summaries?
+2. When skip candidates compete, are richer bridge summaries being favored over merely recent ones?
+
+Implementation change
+---------------------
+We now track explicit chain-richness fields on every chain summary:
+
+- `hop_count`
+- `order_span`
+- `temporal_span_seconds`
+
+These fields are computed during chain extension and carried into anchored skip candidates.
+
+We also added a chain-richness report with two stages:
+
+- `created_chains`
+- `anchored_chains`
+
+For each stage we record:
+
+- count
+- mean / max hop count
+- mean / max insertion-order span
+- mean / max temporal span
+- mean / max representative-event count
+
+Skip-generation preference change
+---------------------------------
+Skip candidate retention and ranking now explicitly prefer richer chain bridges.
+
+Operationally:
+1. Chain anchors retain their hop/order/temporal span signals in the candidate index.
+2. Anchor retention no longer behaves like plain recency filtering for chain summaries.
+3. When two candidates share a similar bridge signature, the richer chain summary is preferred before
+   falling back to recency.
+
+The current prototype uses a bounded richness bonus based on:
+
+\[
+\text{richness}(c)
+= 0.45 \cdot \min(h(c)/4, 1)
++ 0.30 \cdot \min(o(c)/16, 1)
++ 0.25 \cdot \min(t(c)/86400, 1)
+\]
+
+where:
+- \(h(c)\) is hop count
+- \(o(c)\) is insertion-order span
+- \(t(c)\) is temporal span in seconds
+
+This bonus is used both:
+- in anchor retention order
+- in skip-candidate aggregation / tie-breaking
+
+Why this is reasonable
+----------------------
+The goal of skip links is to preserve compressed long-range support, not merely to keep the newest summary.
+Favoring richer bridge objects is therefore better aligned with the retrieval objective:
+
+- longer causal bridge
+- broader temporal context
+- more compressed support evidence
+
+while still keeping construction deterministic and bounded.
+
+Engineering note
+----------------
+The SQLite streaming builder now exports both:
+
+- skip funnel reports
+- chain richness reports
+
+in JSON and Markdown form, so future ablations can verify whether skip-link changes are increasing the
+availability of genuinely rich bridge objects rather than only changing thresholds.
+
+
+IBM AML evaluation position (current)
+-------------------------------------
+Scope
+-----
+The AML benchmark should be interpreted primarily as a retrieval and decision-support sanity check,
+not as the main optimization target of the project. The project goal remains:
+
+- efficient causal temporal indexing
+- budgeted historical evidence retrieval
+- low latency and bounded context size
+
+The downstream LLM classification result is useful, but secondary.
+
+Best retrieval-side result to report
+------------------------------------
+For the current 5M-event rich SQLite index, the cleanest retrieval headline is:
+
+- file:
+  `outputs/ibm_aml/realcase_eval_5000000_rich_random100_tuned_v3/aggregate.csv`
+- variant: `timeindex_full`
+- budget: `8`
+- gold policy: `union`
+
+Observed metrics on 100 positive real-case queries:
+
+- recall = `0.7956984126984126`
+- precision = `0.45748809523809525`
+- F1 = `0.5391787722081838`
+- context efficiency = `0.20046074263038544`
+- latency = `6.131697907112539 ms`
+- mean gold size = `3.51`
+- mean retrieved size = `5.82`
+
+Interpretation:
+1. Under a small retrieval budget, the index is recovering a substantial fraction of available prior evidence.
+2. Precision is moderate rather than high, which is acceptable at the retrieval layer because the downstream agent
+   is expected to judge and summarize the returned context.
+3. Query latency remains low enough to support the "online decision support" story.
+
+Best 100-positive / 100-negative downstream sanity check
+--------------------------------------------------------
+The strongest balanced single-agent DeepSeek run is:
+
+- file:
+  `outputs/ibm_aml/deepseek_sample_5000000_100p_late4m_100n_any/results.json`
+
+Observed metrics:
+
+- TP = `62`
+- FP = `13`
+- TN = `87`
+- FN = `38`
+- accuracy = `0.745`
+- precision = `0.8266666666666667`
+- recall = `0.62`
+- specificity = `0.87`
+- F1 = `0.7085714285714284`
+
+Interpretation:
+1. The retrieved context is informative enough for a lightweight downstream agent to separate many positives
+   from negatives.
+2. Recall remains meaningfully below perfect, which is consistent with the retrieval layer still missing some
+   long-range or weakly expressed historical support.
+3. This is "reasonable enough" for a prototype index paper, but not yet a fully optimized AML detector.
+
+Prompt-format observation
+-------------------------
+The simplest flattened-event prompt remains the strongest small-batch downstream presentation format.
+
+In the 10-positive / 10-negative prompt-format comparison:
+
+- flattened baseline:
+  precision `0.7272727272727273`, recall `0.8`, F1 `0.761904761904762`
+- JSON evidence cards v2:
+  precision `0.6`, recall `0.6`, F1 `0.6`
+
+Therefore, the JSON-card representation should currently be treated as an experimental evidence-structuring
+direction, not as the default evaluation presentation layer.
+
+Current skip-link conclusion on IBM AML
+---------------------------------------
+The most important negative result is that skip links are still not producing a measurable retrieval gain on AML.
+
+From:
+
+- `outputs/ibm_aml/sqlite_ablation_compare_5000000_skipv2/aggregate.csv`
+
+For `gold_policy = union`:
+
+At budget `10`:
+- `chain_only`:
+  recall `0.8596754047895689`, precision `0.389171189309057`, F1 `0.49604541207895414`
+- `timeindex_no_skip`:
+  recall `0.8423381842481349`, precision `0.41896883753501396`, F1 `0.5174212882878948`
+- `timeindex_full`:
+  recall `0.8423381842481349`, precision `0.41896883753501396`, F1 `0.5174212882878948`
+
+At budget `20`:
+- `chain_only`:
+  recall `0.9307455020926141`, precision `0.34687568792706036`, F1 `0.4648817785169517`
+- `timeindex_no_skip`:
+  recall `0.9043916000929111`, precision `0.37179351949586764`, F1 `0.48758779597992247`
+- `timeindex_full`:
+  recall `0.9043916000929111`, precision `0.37179351949586764`, F1 `0.48758779597992247`
+
+Interpretation:
+1. The full system is not worse than the no-skip system, but it is also not yet better on this dataset.
+2. This suggests that the AML data slice may not currently expose enough long-range bridge structure for the
+   present skip-anchor policy to pay off, or that skip-object selection still needs a more general abstraction.
+3. This should be described honestly as an open optimization target, not hidden.
+
+Paper-facing recommendation
+---------------------------
+The paper should emphasize:
+
+1. strong budgeted retrieval recall under causal constraints
+2. low query latency with bounded evidence size
+3. scalable indexing over millions of timestamped events
+
+It should avoid over-claiming:
+
+1. that the current AML downstream classifier is state of the art
+2. that skip links are already delivering consistent gains on AML
+
+A fair current claim is:
+
+\[
+\text{TimeIndex already provides efficient, causal, compact temporal evidence retrieval at scale;}
+\]
+\[
+\text{skip-link construction is implemented and efficient, but its retrieval advantage remains dataset-dependent}
+\]
+\[
+\text{and still needs further validation on workloads with stronger long-range temporal dependencies.}
+\]
+
+LANL verifier update
+--------------------
+We added a lightweight post-LLM verifier for LANL whose job is not to re-classify the whole case from scratch,
+but to decide whether a positive claim is structurally supported by the retrieved evidence.
+
+Current verifier logic explicitly preserves positives when at least one stronger structural signal is present:
+
+1. `query_dst_precursor = true`
+2. `chain_count > 0`
+3. `temporal_bridge + multi_step_context + detached continuity`
+4. skip-supported bridge evidence with direct continuity into the query
+
+It vetoes positives when the evidence is dominated by weak corridor-like patterns such as:
+
+1. lone skip-fanout without precursor or chain corroboration
+2. detached skip story without a direct bridged path into the query
+3. high-baseline routine touch corridor:
+   no chain, no precursor, no fanout, only `query_host_touch` / `user_continuity_detached`,
+   and very high prior user activity
+
+Feature summary used by the verifier:
+
+1. structural:
+   `chain_count`, `skip_count`, `skip_source_host_fanout_count`,
+   `has_query_dst_precursor`, `has_temporal_bridge`, `has_multi_step_context`
+2. weak-pattern dominance:
+   `event_query_host_touch_count`, `event_detached_count`, `event_weak_pattern_count`,
+   `direct_query_touch_count`
+3. temporal:
+   `max_span_seconds`
+4. baseline:
+   `prior_user_event_count`, `prior_user_host_count`, `high_baseline_user_activity`
+
+LANL verifier audit on 50 positive / 50 negative queries
+--------------------------------------------------------
+From:
+
+- `outputs/lanl/verifier_audit_50p_50n_v2/verifier_audit.json`
+
+Same-run comparison using `llm_predicted_positive` as the baseline and final `predicted_positive` after verifier:
+
+LLM-only (same run):
+
+- TP = `4`
+- FP = `6`
+- TN = `44`
+- FN = `46`
+- accuracy = `0.48`
+- precision = `0.4`
+- recall = `0.08`
+- F1 = `0.13333333333333333`
+
+LLM + verifier:
+
+- TP = `4`
+- FP = `0`
+- TN = `50`
+- FN = `46`
+- accuracy = `0.54`
+- precision = `1.0`
+- recall = `0.08`
+- F1 = `0.14814814814814814`
+
+Verifier override audit:
+
+- overrides = `6`
+- helpful overrides = `6`
+- harmful overrides = `0`
+- neutral overrides = `0`
+
+The verifier removed all six LLM false positives in this sample:
+
+1. `auth-05043949`
+2. `auth-05073864`
+3. `auth-05077570`
+4. `auth-05080827`
+5. `auth-05266944`
+6. `auth-05398380`
+
+It preserved all four LLM true positives:
+
+1. `auth-04562704`
+2. `auth-04704358`
+3. `auth-04917838`
+4. `auth-05104203`
+
+Interpretation:
+1. The verifier is now functioning as a precision filter rather than a second classifier.
+2. It removes weak skip/corridor false positives without harming the bridge-backed positives currently found by the LLM.
+3. The dominant remaining weakness on LANL is recall, not verifier safety.
+
+Current skip-link conclusion on LANL
+------------------------------------
+From:
+
+- `outputs/lanl/skip_effectiveness_tail1m_b12.json`
+- `outputs/lanl/skip_effectiveness_tail1m_b12_diagnosis.json`
+
+On the 66 positive tail-window queries:
+
+- queries with skip objects = `32 / 66`
+- queries where full retrieval differs from no-skip = `32 / 66`
+- queries with temporal gain over no-skip = `11 / 66`
+- queries with temporal gain over chain-only frontier = `4 / 66`
+- mean extra events from skip across positives = `0.3333333333333333`
+- mean skip objects per query = `0.5454545454545454`
+
+Cluster diagnosis for changed queries:
+
+1. `bootstrap_recovery`: `4`
+2. `lateral_swap`: `20`
+3. `long_range_bridge`: `2`
+4. `minor_temporal_extension`: `4`
+5. `multi_event_bridge`: `2`
+
+Interpretation:
+1. Skip links are useful, but not uniformly useful.
+2. Their strongest value is in `bootstrap_recovery` and `long_range_bridge` cases where ordinary/no-skip retrieval
+   misses older but structurally relevant history.
+3. Many changed queries are only `lateral_swap` cases, where skip links alter the selected evidence set but do not
+   materially improve temporal reach.
+4. Therefore, skip links should be kept, but their ranking/gating policy should continue to be optimized so they fire
+   mainly on bridge-worthy cases instead of weak corridor substitutions.
+
+Paper-facing LANL claim
+-----------------------
+A fair current LANL-facing claim is:
+
+\[
+\text{Skip links provide selective but real value for causal temporal retrieval, especially when ordinary traversal}
+\]
+\[
+\text{cannot bootstrap any useful history or cannot bridge to older multi-step evidence.}
+\]
+\[
+\text{A lightweight structural verifier can then suppress weak skip-induced false positives without reducing recall}
+\]
+\[
+\text{on the currently recovered positives.}
+\]

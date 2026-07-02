@@ -23,6 +23,9 @@ class AnchorEntry:
     rarity: float
     intent_name: str | None
     insertion_order: int
+    hop_count: int = 0
+    order_span: int = 0
+    temporal_span_seconds: float = 0.0
 
 
 class AnchorTable:
@@ -35,7 +38,7 @@ class AnchorTable:
     def add(self, entry: AnchorEntry) -> None:
         self._entries = [item for item in self._entries if item.anchor_id != entry.anchor_id]
         self._entries.append(entry)
-        self._entries.sort(key=lambda item: (-item.insertion_order, item.anchor_id))
+        self._entries.sort(key=lambda item: _retention_sort_key(item))
         self._entries = self._entries[: self.limit]
 
     def recent(self) -> list[AnchorEntry]:
@@ -60,7 +63,7 @@ class CorrIndex:
             return
         self._entries = [item for item in self._entries if item.anchor_id != entry.anchor_id]
         self._entries.append(entry)
-        self._entries.sort(key=lambda item: (-item.insertion_order, item.anchor_id))
+        self._entries.sort(key=lambda item: _retention_sort_key(item))
         self._entries = self._entries[: self.limit]
 
     def query(self, vector: np.ndarray | None, limit: int) -> list[tuple[AnchorEntry, float]]:
@@ -114,7 +117,7 @@ class IntentIndex:
     def add(self, entry: AnchorEntry) -> None:
         self._entries = [item for item in self._entries if item.anchor_id != entry.anchor_id]
         self._entries.append(entry)
-        self._entries.sort(key=lambda item: (-item.insertion_order, item.anchor_id))
+        self._entries.sort(key=lambda item: _retention_sort_key(item))
         self._entries = self._entries[: self.limit]
 
     def query(self, intent: DecisionIntent | None) -> list[tuple[AnchorEntry, float]]:
@@ -150,7 +153,7 @@ class AspectIndex:
     def add(self, entry: AnchorEntry) -> None:
         self._entries = [item for item in self._entries if item.anchor_id != entry.anchor_id]
         self._entries.append(entry)
-        self._entries.sort(key=lambda item: (-item.insertion_order, item.anchor_id))
+        self._entries.sort(key=lambda item: _retention_sort_key(item))
         self._entries = self._entries[: self.limit]
 
     def query(self, aspects: set[str]) -> list[tuple[AnchorEntry, float]]:
@@ -196,6 +199,9 @@ class SkipCandidateIndex:
             rarity=float(record.metadata.rarity),
             intent_name=intent.name if intent is not None else None,
             insertion_order=self._next_insertion_order(),
+            hop_count=1,
+            order_span=0,
+            temporal_span_seconds=0.0,
         )
         self._add_entry(entry)
 
@@ -209,6 +215,9 @@ class SkipCandidateIndex:
             rarity=float(summary.dependency_confidence),
             intent_name=intent.name if intent is not None else None,
             insertion_order=self._next_insertion_order(),
+            hop_count=max(1, int(getattr(summary, "hop_count", 0)) or max(1, len(summary.representative_event_ids))),
+            order_span=max(0, int(getattr(summary, "order_span", 0))),
+            temporal_span_seconds=max(0.0, float(getattr(summary, "temporal_span_seconds", 0.0))),
         )
         self._add_entry(entry)
 
@@ -226,6 +235,7 @@ class SkipCandidateIndex:
 
         aggregate_scores: dict[str, float] = {}
         insertion_orders: dict[str, int] = {}
+        richness_scores: dict[str, float] = {}
 
         def add_scored(entries: list[tuple[AnchorEntry, float]]) -> None:
             for entry, score in entries:
@@ -234,11 +244,13 @@ class SkipCandidateIndex:
                 participant_score = _participant_relevance(entry.obj, event)
                 inflow_score = _inflow_relevance(entry.obj, event)
                 generic_penalty = _generic_penalty(entry.obj)
-                total_score = score + 0.35 * participant_score + 0.35 * inflow_score - generic_penalty
+                chain_richness = _chain_richness_bonus(entry)
+                total_score = score + 0.30 * participant_score + 0.25 * inflow_score + 0.20 * chain_richness - generic_penalty
                 if total_score <= 0.0:
                     continue
                 aggregate_scores[entry.anchor_id] = aggregate_scores.get(entry.anchor_id, 0.0) + total_score
                 insertion_orders[entry.anchor_id] = entry.insertion_order
+                richness_scores[entry.anchor_id] = chain_richness
 
         add_scored([(entry, 0.05) for entry in self.anchor_table.recent()])
         add_scored(self.corr_index.query(event.sketch, self.config.correlation_candidates))
@@ -256,7 +268,7 @@ class SkipCandidateIndex:
         )
         ranked = sorted(
             aggregate_scores.items(),
-            key=lambda item: (-item[1], -insertion_orders[item[0]], item[0]),
+            key=lambda item: (-item[1], -richness_scores.get(item[0], 0.0), -insertion_orders[item[0]], item[0]),
         )
 
         diversified: list[str] = []
@@ -351,6 +363,29 @@ def _cosine_similarity(vec_a: np.ndarray | None, vec_b: np.ndarray | None) -> fl
     if denom == 0.0:
         return 0.0
     return float(np.dot(vec_a, vec_b) / denom)
+
+
+def _entry_kind_priority(entry: AnchorEntry) -> int:
+    return 1 if entry.kind == "chain" else 0
+
+
+def _chain_richness_bonus(entry: AnchorEntry) -> float:
+    if entry.kind != "chain":
+        return 0.0
+    hop_signal = min(float(entry.hop_count) / 4.0, 1.0)
+    order_signal = min(float(entry.order_span) / 16.0, 1.0)
+    temporal_signal = min(float(entry.temporal_span_seconds) / 86_400.0, 1.0)
+    return 0.45 * hop_signal + 0.30 * order_signal + 0.25 * temporal_signal
+
+
+def _retention_sort_key(entry: AnchorEntry) -> tuple[float, float, float, float, str]:
+    return (
+        -float(_entry_kind_priority(entry)),
+        -float(_chain_richness_bonus(entry)),
+        -float(entry.rarity),
+        -float(entry.insertion_order),
+        entry.anchor_id,
+    )
 
 
 def _bridge_signature(obj: EventRecord | ChainSummary) -> tuple[str, ...]:

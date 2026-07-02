@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -110,6 +111,9 @@ def retrieve(
         next_candidate = _pick_best_candidate(ordinary_candidate, skip_candidate, config)
         if next_candidate is None or next_candidate.marginal_utility < stop_threshold:
             break
+        if next_candidate.kind == "skip" and not _should_select_skip_candidate(next_candidate, selected, intent):
+            _remove_candidate(frontier, next_candidate)
+            continue
 
         evidence = _materialize_evidence(next_candidate, budget - spent_budget, config)
         if evidence is None:
@@ -141,6 +145,25 @@ def retrieve(
                     branch_factor=config.max_branch_factor,
                 )
                 ,
+                selected,
+                query_record,
+                intent,
+                selected_object_ids,
+                config,
+                scoring_config,
+            )
+            _enqueue_candidates(
+                frontier,
+                _expand_skip_frontier(
+                    index,
+                    next_candidate.predecessor_id,
+                    query_record,
+                    intent,
+                    skip_seen,
+                    lookup_cache,
+                    query_time_key,
+                    depth=next_candidate.depth + 1,
+                ),
                 selected,
                 query_record,
                 intent,
@@ -276,15 +299,37 @@ def _initialize_skip_frontier(
     lookup_cache: _LookupCache,
     query_time_key: tuple[int, float | str],
 ) -> list[_FrontierCandidate]:
+    return _skip_frontier_for_target(
+        index,
+        query_record.event.event_id,
+        query_record,
+        intent,
+        skip_seen,
+        lookup_cache,
+        query_time_key,
+        depth=0,
+    )
+
+
+def _skip_frontier_for_target(
+    index: Any,
+    target_event_id: str,
+    query_record: EventRecord,
+    intent: DecisionIntent,
+    skip_seen: set[tuple[str, str]],
+    lookup_cache: _LookupCache,
+    query_time_key: tuple[int, float | str],
+    depth: int,
+) -> list[_FrontierCandidate]:
     skip_link_store = getattr(index, "skip_link_store", index)
-    incoming_links = _get_incoming_links(skip_link_store, query_record.event.event_id, skip=True)
+    incoming_links = _get_incoming_links(skip_link_store, target_event_id, skip=True)
     candidates: list[_FrontierCandidate] = []
     for link in incoming_links:
         key = (link.from_id, link.to_id)
         if key in skip_seen or link.from_id == link.to_id:
             continue
         skip_seen.add(key)
-        candidate = _skip_candidate(index, link, query_record, intent, lookup_cache, query_time_key)
+        candidate = _skip_candidate(index, link, query_record, intent, lookup_cache, query_time_key, depth=depth)
         if candidate is not None:
             candidates.append(candidate)
     return candidates
@@ -318,7 +363,6 @@ def _ordinary_candidate(
             matching_summary.tail_id,
         ]
         event_ids = _causal_event_ids(index, event_ids, query_record, lookup_cache, query_time_key)
-        summary_text = matching_summary.summary or f"Ordinary chain {matching_summary.chain_id}"
         if not event_ids:
             event_ids = _causal_event_ids(index, [matching_summary.head_id], query_record, lookup_cache, query_time_key)
         if not event_ids:
@@ -327,18 +371,32 @@ def _ordinary_candidate(
         aspects = set(matching_summary.aspects)
         object_id = matching_summary.chain_id
         predecessor_id = matching_summary.head_id
+        base_summary = matching_summary.summary or f"Ordinary chain {matching_summary.chain_id}"
     else:
         event_ids = _causal_event_ids(index, [link.predecessor_id], query_record, lookup_cache, query_time_key)
         if not event_ids:
             return None
-        summary_text = f"Ordinary evidence from {link.predecessor_id} to {link.successor_id}"
         cost = 1.0
         aspects = _collect_event_aspects(index, [link.predecessor_id, link.successor_id], lookup_cache)
         object_id = f"ordinary:{link.predecessor_id}->{link.successor_id}"
         predecessor_id = link.predecessor_id
+        base_summary = f"Ordinary evidence from {link.predecessor_id} to {link.successor_id}"
 
     if not aspects:
         aspects = set(intent.aspects) if intent.aspects else {"ordinary_evidence"}
+
+    representative_records = _records_for_ids(index, event_ids, lookup_cache)
+    bridge_score = _bridge_score(index, event_ids, query_record, lookup_cache)
+    lanl_aspects = _derive_lanl_aspects(query_record, representative_records)
+    if lanl_aspects:
+        aspects.update(lanl_aspects)
+    summary_text = _candidate_summary(
+        kind="ordinary",
+        query_record=query_record,
+        representative_records=representative_records,
+        base_summary=base_summary,
+        bridge_score=bridge_score,
+    )
 
     evidence = EvidenceObject(
         object_id=object_id,
@@ -353,7 +411,7 @@ def _ordinary_candidate(
         representative_event_ids=list(event_ids),
         depth=depth,
         kind="ordinary",
-        bridge_score=_bridge_score(index, event_ids, query_record, lookup_cache),
+        bridge_score=bridge_score,
         density_score=_density_score(index, event_ids, lookup_cache),
         generic_penalty=_generic_penalty(aspects),
     )
@@ -366,30 +424,43 @@ def _skip_candidate(
     intent: DecisionIntent,
     lookup_cache: _LookupCache,
     query_time_key: tuple[int, float | str],
+    depth: int,
 ) -> _FrontierCandidate | None:
     aspects = set(link.aspects) or set(intent.aspects) or {"skip_evidence"}
-    evidence = EvidenceObject(
-        object_id=f"skip:{link.from_id}->{link.to_id}",
-        event_ids=[],
-        aspects=aspects,
-        summary=link.summary or f"Skip summary from {link.from_id} to {link.to_id}",
-        cost=float(link.cost or 1.0),
-    )
     representative_ids = _causal_event_ids(index, list(link.representative_event_ids), query_record, lookup_cache, query_time_key)
     if not representative_ids:
         representative_ids = _causal_event_ids(index, [link.from_id], query_record, lookup_cache, query_time_key)
     if not representative_ids:
         return None
+    representative_records = _records_for_ids(index, representative_ids, lookup_cache)
+    bridge_score = max(
+        _bridge_score(index, representative_ids, query_record, lookup_cache),
+        _entity_bridge_score(link, query_record),
+    )
+    lanl_aspects = _derive_lanl_aspects(query_record, representative_records)
+    if lanl_aspects:
+        aspects.update(lanl_aspects)
+    evidence = EvidenceObject(
+        object_id=f"skip:{link.from_id}->{link.to_id}",
+        event_ids=[],
+        aspects=aspects,
+        summary=_candidate_summary(
+            kind="skip",
+            query_record=query_record,
+            representative_records=representative_records,
+            base_summary=link.summary or f"Skip summary from {link.from_id} to {link.to_id}",
+            bridge_score=bridge_score,
+        ),
+        cost=float(link.cost or 1.0),
+    )
+    navigation_id = representative_ids[-1] if representative_ids else link.from_id
     return _FrontierCandidate(
         evidence=evidence,
-        predecessor_id=link.from_id,
+        predecessor_id=navigation_id,
         representative_event_ids=representative_ids,
-        depth=0,
+        depth=depth,
         kind="skip",
-        bridge_score=max(
-            _bridge_score(index, representative_ids, query_record, lookup_cache),
-            _entity_bridge_score(link, query_record),
-        ),
+        bridge_score=bridge_score,
         density_score=_density_score(index, representative_ids, lookup_cache),
         generic_penalty=_generic_penalty(aspects),
     )
@@ -498,6 +569,31 @@ def _expand_ordinary_frontier(
     return candidates
 
 
+def _expand_skip_frontier(
+    index: Any,
+    event_id: str,
+    query_record: EventRecord,
+    intent: DecisionIntent,
+    skip_seen: set[tuple[str, str]],
+    lookup_cache: _LookupCache,
+    query_time_key: tuple[int, float | str],
+    depth: int,
+) -> list[_FrontierCandidate]:
+    target_record = _get_event_record(index, event_id, lookup_cache)
+    if target_record is None:
+        return []
+    return _skip_frontier_for_target(
+        index,
+        target_record.event.event_id,
+        query_record,
+        intent,
+        skip_seen,
+        lookup_cache,
+        query_time_key,
+        depth=depth,
+    )
+
+
 def _marginal_utility(
     candidate: _FrontierCandidate,
     selected: Sequence[EvidenceObject],
@@ -514,15 +610,32 @@ def _marginal_utility(
     )
     depth_bonus = 1.0 / float(candidate.depth + 1)
     query_relevance = _query_overlap(candidate.evidence.event_ids, query_record.event.event_id)
-    skip_bonus = 0.05 if candidate.kind == "skip" and candidate.bridge_score >= 0.5 else 0.0
+    if candidate.kind != "skip":
+        utility = (
+            0.55 * utility
+            + 0.15 * query_relevance
+            + 0.10 * depth_bonus
+            + 0.15 * candidate.bridge_score
+            + 0.10 * candidate.density_score
+            - 0.15 * candidate.generic_penalty
+        )
+        return max(0.0, min(1.0, utility))
+
+    support_score = _skip_support_score(candidate)
+    specificity_score = _skip_specificity_score(candidate.evidence.aspects)
+    novel_specific_gain = _skip_novel_specific_gain(candidate.evidence.aspects, selected, intent)
+    skip_bonus = 0.05 if candidate.bridge_score >= 0.85 and support_score >= 0.50 else 0.0
     utility = (
-        0.55 * utility
-        + 0.15 * query_relevance
-        + 0.10 * depth_bonus
-        + 0.15 * candidate.bridge_score
+        0.40 * utility
+        + 0.10 * query_relevance
+        + 0.05 * depth_bonus
+        + 0.20 * candidate.bridge_score
         + 0.10 * candidate.density_score
+        + 0.10 * support_score
+        + 0.10 * specificity_score
+        + 0.15 * novel_specific_gain
         + skip_bonus
-        - 0.15 * candidate.generic_penalty
+        - 0.25 * candidate.generic_penalty
     )
     return max(0.0, min(1.0, utility))
 
@@ -546,6 +659,8 @@ def _enqueue_candidates(
             continue
         candidate.marginal_utility = _marginal_utility(candidate, selected, query_record, intent, scoring_config)
         candidate.priority = candidate.marginal_utility / (candidate.evidence.cost + config.priority_epsilon)
+        if candidate.kind == "skip":
+            candidate.priority *= _skip_priority_multiplier(candidate, selected, intent)
         signature = _candidate_signature(candidate)
         existing = best_by_signature.get(signature)
         if existing is not None and (
@@ -566,6 +681,8 @@ def _enqueue_candidates(
 
 
 def _candidate_signature(candidate: _FrontierCandidate) -> tuple[str, str | None]:
+    if candidate.kind == "skip":
+        return (candidate.kind, candidate.evidence.object_id)
     return (candidate.kind, candidate.predecessor_id or candidate.evidence.object_id)
 
 
@@ -643,6 +760,90 @@ def _generic_penalty(aspects: set[str]) -> float:
     return 0.0
 
 
+def _specific_aspects(aspects: set[str]) -> set[str]:
+    return {
+        aspect
+        for aspect in aspects
+        if aspect not in {"generic_evidence", "ordinary_evidence", "skip_evidence"}
+    }
+
+
+def _skip_support_score(candidate: _FrontierCandidate) -> float:
+    return max(0.0, min(1.0, float(len(candidate.representative_event_ids)) / 4.0))
+
+
+def _skip_specificity_score(aspects: set[str]) -> float:
+    if not aspects:
+        return 0.0
+    specific = _specific_aspects(aspects)
+    return len(specific) / len(aspects)
+
+
+def _skip_novel_specific_gain(
+    aspects: set[str],
+    selected: Sequence[EvidenceObject],
+    intent: DecisionIntent,
+) -> float:
+    specific = _specific_aspects(aspects)
+    if not specific:
+        return 0.0
+    selected_specific = set().union(*(_specific_aspects(item.aspects) for item in selected)) if selected else set()
+    novel = specific - selected_specific
+    if not novel:
+        return 0.0
+    if not intent.aspects:
+        return 1.0
+    return 1.0 if (novel & set(intent.aspects)) else 0.0
+
+
+def _skip_priority_multiplier(
+    candidate: _FrontierCandidate,
+    selected: Sequence[EvidenceObject],
+    intent: DecisionIntent,
+) -> float:
+    support_score = _skip_support_score(candidate)
+    specificity_score = _skip_specificity_score(candidate.evidence.aspects)
+    novel_specific_gain = _skip_novel_specific_gain(candidate.evidence.aspects, selected, intent)
+    multiplier = (
+        0.10
+        + 0.40 * candidate.bridge_score
+        + 0.15 * candidate.density_score
+        + 0.15 * support_score
+        + 0.20 * novel_specific_gain
+        + 0.10 * specificity_score
+        - 0.30 * candidate.generic_penalty
+    )
+    return max(0.05, min(1.0, multiplier))
+
+
+def _should_select_skip_candidate(
+    candidate: _FrontierCandidate,
+    selected: Sequence[EvidenceObject],
+    intent: DecisionIntent,
+) -> bool:
+    candidate_specific = _specific_aspects(candidate.evidence.aspects)
+    selected_aspects = set().union(*(item.aspects for item in selected)) if selected else set()
+    selected_specific = _specific_aspects(selected_aspects)
+
+    if not intent.aspects:
+        return candidate.bridge_score >= 0.9 and _skip_support_score(candidate) >= 0.5
+
+    intent_aspects = set(intent.aspects)
+    uncovered_intent_aspects = intent_aspects - selected_aspects
+    new_intent_aspects = (candidate_specific & intent_aspects) - selected_specific
+    if new_intent_aspects:
+        return True
+
+    if not uncovered_intent_aspects:
+        return False
+
+    return (
+        candidate.bridge_score >= 0.95
+        and _skip_support_score(candidate) >= 0.75
+        and candidate.generic_penalty <= 0.0
+    )
+
+
 def _weighted_aspect_overlap(candidate_aspects: set[str], intent: DecisionIntent) -> float:
     if not candidate_aspects:
         return 0.0
@@ -686,6 +887,189 @@ def _collect_event_aspects(
     return aspects
 
 
+def _records_for_ids(
+    index: Any,
+    event_ids: Sequence[str],
+    lookup_cache: _LookupCache,
+) -> list[EventRecord]:
+    records: list[EventRecord] = []
+    for event_id in event_ids:
+        record = _get_event_record(index, event_id, lookup_cache)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def _candidate_summary(
+    *,
+    kind: str,
+    query_record: EventRecord,
+    representative_records: Sequence[EventRecord],
+    base_summary: str,
+    bridge_score: float,
+) -> str:
+    if not representative_records or not _is_lanl_record(query_record):
+        return base_summary
+
+    stats = _lanl_candidate_stats(query_record, representative_records)
+    sanitized_base = _strip_bridge_annotation(base_summary)
+    pattern = str(stats["pattern"])
+    kind_label = "skip" if kind == "skip" else ("chain" if len(representative_records) > 1 else "event")
+    detached = "true" if bool(stats["detached_from_query"]) else "false"
+    dst_precursor = "true" if bool(stats["query_dst_precursor"]) else "false"
+    query_host_touch = "true" if bool(stats["query_host_touch"]) else "false"
+    same_user = int(stats["same_user_count"])
+    same_src = int(stats["same_src_count"])
+    same_dst = int(stats["same_dst_count"])
+    real_targets = int(stats["distinct_real_targets_from_query_src"])
+    span_seconds = int(round(float(stats["span_seconds"])))
+    return (
+        f"LANL {kind_label} pattern={pattern}; bridge={bridge_score:.2f}; "
+        f"same_user={same_user}; same_src_host={same_src}; same_dst_host={same_dst}; "
+        f"real_targets_from_query_src={real_targets}; query_dst_precursor={dst_precursor}; "
+        f"query_host_touch={query_host_touch}; detached_from_query={detached}; "
+        f"span_seconds={span_seconds}; base={sanitized_base}"
+    )
+
+
+def _derive_lanl_aspects(
+    query_record: EventRecord,
+    representative_records: Sequence[EventRecord],
+) -> set[str]:
+    if not representative_records or not _is_lanl_record(query_record):
+        return set()
+
+    stats = _lanl_candidate_stats(query_record, representative_records)
+    aspects: set[str] = {str(stats["pattern"])}
+    if bool(stats["query_dst_precursor"]):
+        aspects.add("lanl_query_dst_precursor")
+    if bool(stats["query_host_touch"]):
+        aspects.add("lanl_query_host_touch")
+    if int(stats["distinct_real_targets_from_query_src"]) >= 2:
+        aspects.add("lanl_source_host_fanout")
+    if int(stats["same_user_real_targets"]) >= 2:
+        aspects.add("lanl_credential_reuse")
+    if bool(stats["detached_from_query"]):
+        aspects.add("lanl_detached_history")
+    if float(stats["span_seconds"]) >= 60.0:
+        aspects.add("lanl_temporal_bridge")
+    if len(representative_records) >= 2:
+        aspects.add("lanl_multi_step_context")
+    return {aspect for aspect in aspects if aspect}
+
+
+def _lanl_candidate_stats(
+    query_record: EventRecord,
+    representative_records: Sequence[EventRecord],
+) -> dict[str, int | float | bool | str]:
+    query_user = str(query_record.event.attrs.get("src_user") or "")
+    query_src = str(query_record.event.attrs.get("src_computer") or "")
+    query_dst = str(query_record.event.attrs.get("dst_computer") or "")
+    query_auth = str(query_record.event.attrs.get("auth_type") or "")
+    same_user_count = 0
+    same_src_count = 0
+    same_dst_count = 0
+    same_path_count = 0
+    same_auth_count = 0
+    query_host_touch_count = 0
+    real_targets_from_query_src: set[str] = set()
+    same_user_real_targets: set[str] = set()
+    time_values: list[float] = []
+
+    for record in representative_records:
+        attrs = record.event.attrs
+        src_user = str(attrs.get("src_user") or "")
+        src_host = str(attrs.get("src_computer") or "")
+        dst_host = str(attrs.get("dst_computer") or "")
+        auth_type = str(attrs.get("auth_type") or "")
+        parsed_time = _parse_time_value(record.event.time)
+        if parsed_time is not None:
+            time_values.append(parsed_time)
+        if query_user and src_user == query_user:
+            same_user_count += 1
+            if _is_real_host(dst_host, src_host):
+                same_user_real_targets.add(dst_host)
+        if query_src and src_host == query_src:
+            same_src_count += 1
+            if _is_real_host(dst_host, src_host):
+                real_targets_from_query_src.add(dst_host)
+        if query_dst and dst_host == query_dst:
+            same_dst_count += 1
+        if query_auth and auth_type == query_auth:
+            same_auth_count += 1
+        if query_user and query_src and query_dst and src_user == query_user and src_host == query_src and dst_host == query_dst:
+            same_path_count += 1
+        if (query_src and (src_host == query_src or dst_host == query_src)) or (
+            query_dst and (src_host == query_dst or dst_host == query_dst)
+        ):
+            query_host_touch_count += 1
+
+    query_dst_precursor = same_dst_count > 0
+    query_host_touch = query_host_touch_count > 0
+    detached_from_query = not query_dst_precursor and not query_host_touch
+    span_seconds = (max(time_values) - min(time_values)) if len(time_values) >= 2 else 0.0
+
+    pattern = "lanl_weak_or_fragmented_history"
+    if same_src_count >= 2 and len(real_targets_from_query_src) >= 2:
+        pattern = "lanl_source_host_fanout"
+    elif same_user_count >= 2 and len(same_user_real_targets) >= 2:
+        pattern = "lanl_credential_reuse_across_hosts"
+    elif query_dst_precursor and query_host_touch:
+        pattern = "lanl_bridge_into_query_host"
+    elif same_path_count >= 1:
+        pattern = "lanl_same_path_repeat"
+    elif query_host_touch:
+        pattern = "lanl_query_host_touch"
+    elif same_user_count >= 1:
+        pattern = "lanl_user_continuity"
+    if detached_from_query and pattern in {
+        "lanl_source_host_fanout",
+        "lanl_credential_reuse_across_hosts",
+        "lanl_user_continuity",
+    }:
+        pattern = f"{pattern}_detached"
+
+    return {
+        "pattern": pattern,
+        "same_user_count": same_user_count,
+        "same_src_count": same_src_count,
+        "same_dst_count": same_dst_count,
+        "same_path_count": same_path_count,
+        "same_auth_count": same_auth_count,
+        "query_host_touch_count": query_host_touch_count,
+        "query_dst_precursor": query_dst_precursor,
+        "query_host_touch": query_host_touch,
+        "detached_from_query": detached_from_query,
+        "distinct_real_targets_from_query_src": len(real_targets_from_query_src),
+        "same_user_real_targets": len(same_user_real_targets),
+        "span_seconds": span_seconds,
+    }
+
+
+def _is_lanl_record(record: EventRecord) -> bool:
+    attrs = record.event.attrs
+    return any(
+        key in attrs
+        for key in ("src_computer", "dst_computer", "src_user", "auth_type", "logon_type")
+    )
+
+
+def _is_tgt_host(value: str) -> bool:
+    return value.strip().lower() == "tgt"
+
+
+def _is_real_host(dst_host: str, src_host: str) -> bool:
+    if not dst_host:
+        return False
+    if _is_tgt_host(dst_host):
+        return False
+    return dst_host != src_host
+
+
+def _strip_bridge_annotation(summary: str) -> str:
+    return re.sub(r"\s*\[bridge=[0-9]+(?:\.[0-9]+)?\]\s*", " ", summary or "").strip()
+
+
 def _remove_candidate(frontier: list[_FrontierCandidate], candidate: _FrontierCandidate) -> None:
     if candidate in frontier:
         frontier.remove(candidate)
@@ -708,7 +1092,7 @@ def _causal_event_ids(
         record = _get_event_record(index, event_id_text, lookup_cache)
         if record is None:
             continue
-        if _time_sort_key(record.event.time) > query_time_key:
+        if _time_sort_key(record.event.time) >= query_time_key:
             continue
         seen.add(event_id_text)
         causal_ids.append(event_id_text)
