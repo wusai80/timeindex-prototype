@@ -1,0 +1,125 @@
+TimeIndex TODO
+==============
+
+Primary next goals
+------------------
+
+1. Use the full data from both datasets
+2. Improve F1 if possible
+3. Improve efficiency
+4. Show the effectiveness of skip links clearly
+
+
+1. Full-data runs
+-----------------
+
+IBM AML:
+
+1. build and keep a full-dataset SQLite index locally
+2. rerun retrieval and downstream evaluation on the full timeline, not only sampled prefixes
+3. verify that late-query sampling is consistent with the available index coverage
+4. separate retrieval evaluation from downstream LLM evaluation
+
+LANL:
+
+1. move beyond the current auth-only tail-window emphasis when practical
+2. build and keep a larger or full auth index locally
+3. test whether full-history skip bridges become more useful on a broader time range
+4. later extend to additional LANL modalities if needed:
+   `proc`, `dns`, `flows`
+
+
+2. Improve F1
+-------------
+
+Retrieval-side:
+
+1. improve positive evidence recall without breaking causal constraints
+2. inspect false negatives with weak or empty retrieved context
+3. tune skip ranking so bridge-worthy anchors surface more often
+4. examine whether some positives need larger or adaptive budgets
+
+Judge-side:
+
+1. keep the verifier as a precision filter, not a second classifier
+2. improve LLM prompt sensitivity on positives with real but subtle evidence
+3. compare single-agent, two-agent, and verifier-assisted setups fairly
+4. measure same-run `llm_predicted_positive` vs final `predicted_positive`
+
+Evaluation:
+
+1. keep reporting TP, FP, TN, FN, precision, recall, F1
+2. separate retrieval improvements from downstream prompt effects
+3. avoid overfitting to a few hand-picked failure cases
+
+
+3. Improve efficiency
+---------------------
+
+Index construction:
+
+1. continue using SQLite persistence for larger runs
+2. keep hot-cache behavior for recent events and links
+3. monitor build throughput regularly on larger datasets
+4. record throughput milestones during long runs
+
+Retrieval:
+
+1. reduce unnecessary frontier expansion
+2. keep bounded top-K selection and cheap prefilters
+3. profile skip candidate generation and skip scoring
+4. compare latency of `chain_only`, `no_skip`, and `full`
+
+Benchmark operations:
+
+1. avoid rebuilding indexes unless logic really changed
+2. reuse local indexes when evaluating prompts or verifier logic
+3. keep datasets and indexes local, not in Git
+
+
+4. Show skip-link effectiveness clearly
+---------------------------------------
+
+Need stronger evidence than one-off examples.
+
+Retrieval-side:
+
+1. compare `chain_only`, `timeindex_no_skip`, and `timeindex_full`
+2. report:
+   - recall
+   - precision
+   - context efficiency
+   - latency
+   - temporal span
+   - extra events recovered by skip
+3. categorize changed queries:
+   - bootstrap recovery
+   - long-range bridge
+   - multi-event bridge
+   - minor temporal extension
+   - lateral swap
+
+Downstream-side:
+
+1. show when skip-derived context helps the judge recover true positives
+2. show when verifier removes weak skip-induced false positives
+3. keep examples for both helpful and unhelpful skip behavior
+
+Paper-facing target:
+
+1. provide at least one benchmark where skip links show a clear retrieval benefit
+2. be honest if benefits are selective rather than universal
+3. distinguish:
+   - skip links change retrieval set
+   - skip links improve temporal reach
+   - skip links improve downstream decision quality
+
+
+Recommended immediate next steps
+--------------------------------
+
+1. push current code to GitHub
+2. keep the current LANL verifier state as the precision-filter baseline
+3. run larger retrieval-side ablations on full or near-full datasets
+4. inspect major false-negative clusters on LANL and IBM AML
+5. identify the best benchmark section for demonstrating skip-link value in the paper
